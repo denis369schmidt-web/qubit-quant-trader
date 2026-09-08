@@ -40,7 +40,9 @@ from institutional_trading_core import (
     QuantitativeRegimeClassifier,
     KrakenPrivateWSGateway,
     NotificationManager,
-    VectorizedOrderbookMath
+    VectorizedOrderbookMath,
+    OrderLifecycleTracker,
+    OrderLifecycleState
 )
 from multi_exchange_websocket_engine import MultiExchangeWebSocketManager
 from stat_arb_kelly_engine import (
@@ -121,7 +123,7 @@ class MultiExchangeTraderApp:
         self.tg_chat_id = saved_tgc or os.environ.get("TELEGRAM_CHAT_ID", "")
         self.discord_webhook = saved_disc or os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-        self.trading_mode = "LIVE"
+        self.trading_mode = "PAPER"
         self.sensitivity_mode = "HYBRID"  # HYBRID / SCALP / MOMENTUM
         self.is_trading_active = True
         self.running = True
@@ -191,10 +193,10 @@ class MultiExchangeTraderApp:
 
         self.btn_mode_toggle = tk.Button(
             btn_frame,
-            text="🔴 MODUS: LIVE KRAKEN",
-            bg="#f43f5e",
+            text="🧪 MODUS: PAPER TRADING",
+            bg="#8b5cf6",
             fg="#ffffff",
-            activebackground="#e11d48",
+            activebackground="#7c3aed",
             font=("Segoe UI", 9, "bold"),
             relief=tk.FLAT,
             command=self.toggle_trading_mode,
@@ -410,7 +412,7 @@ class MultiExchangeTraderApp:
         # 6. LIVE CONSOLE TERMINAL
         self.console = tk.Text(main_frame, bg="#0b0f19", fg="#00ff88", font=("Consolas", 8), height=5, relief=tk.FLAT, highlightbackground="#1e293b", highlightthickness=1)
         self.console.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, pady=(4, 2))
-        self.log_console("⚡ QUBIT QUANT TRADER INITIALISIERT! Hybrid-Modus mit 100% Wallet-Allokation aktiv.")
+        self.log_console("⚡ QUBIT QUANT TRADER INITIALISIERT! Standard-Sicherheitsmodus: PAPER TRADING aktiv.")
 
     def start_balance_fetch_loop(self):
         def loop():
@@ -515,6 +517,20 @@ class MultiExchangeTraderApp:
             else:
                 self.log_console(f"❌ KRAKEN ORDER FEHLER: {res.get('message')}")
                 messagebox.showerror("Order Fehler", f"Kraken API Antwort:\n{res.get('message')}")
+        else:
+            vol = 0.00005 if pair == "XBTEUR" else 1.65
+            sim_sig = {
+                "allowed": True,
+                "signal_type": "BUY",
+                "volume": vol,
+                "stop_loss_price": kraken_p * 0.98,
+                "take_profit_price": kraken_p * 1.03
+            }
+            paper_rec = self.paper_simulator.execute_paper_order(sim_sig, kraken_p * 0.9998, kraken_p * 1.0002)
+            if paper_rec:
+                self.add_trade_to_ledger(paper_rec)
+                self.log_console(f"🧪 MANUELLE PAPER-ORDER SIMULIERT: {paper_rec['side']} {paper_rec['volume']} @ {paper_rec['price']:.2f} €")
+                messagebox.showinfo("Paper Order", f"Paper-Simulation erfolgreich ausgeführt!\n\nPair: {pair}\nSide: BUY\nPreis: {paper_rec['price']:.2f} €")
 
     def open_vault_dialog(self):
         dialog = tk.Toplevel(self.root)
@@ -753,7 +769,15 @@ class MultiExchangeTraderApp:
                                 self.log_console(f"🛡️ {corr_msg}")
                                 continue
 
+                        intent = OrderLifecycleTracker.create_intent(
+                            pair=pair_name,
+                            side=order["side"],
+                            volume=order["volume"],
+                            price=order["price"]
+                        )
+
                         if self.trading_mode == "LIVE":
+                            OrderLifecycleTracker.transition(intent.intent_id, OrderLifecycleState.SUBMITTED)
                             p_dec = KrakenLiveGateway.PAIR_LIMITS.get(pair_name, {}).get("price_decimals", 1)
                             exec_price = round(order["price"], p_dec)
 
@@ -769,18 +793,46 @@ class MultiExchangeTraderApp:
                             )
                             if live_res.get("status") == "success":
                                 self.last_order_time_per_pair[pair_name] = now_tm
+                                txid = live_res['txid']
                                 fee_eur = round(live_res["price"] * live_res["volume"] * 0.0026, 4)
-                                pnl_eur = 0.0
+                                
+                                OrderLifecycleTracker.transition(
+                                    intent.intent_id,
+                                    OrderLifecycleState.FILLED,
+                                    txid=txid,
+                                    filled_vol=live_res["volume"],
+                                    fee_eur=fee_eur
+                                )
 
+                                pnl_eur = 0.0
                                 if live_res["side"] == "BUY":
                                     self.live_entry_prices[asset_code] = live_res["price"]
                                     self.live_peak_prices[asset_code] = live_res["price"]
+                                    self.db_manager.record_buy_trade(
+                                        timestamp=time.strftime("%H:%M:%S"),
+                                        pair=pair_name,
+                                        price=live_res["price"],
+                                        volume=live_res["volume"],
+                                        fee_eur=fee_eur,
+                                        txid=txid,
+                                        status=f"🔴 LIVE EXECUTED ({txid})"
+                                    )
                                 elif live_res["side"] == "SELL":
-                                    entry_p = self.live_entry_prices.get(asset_code, live_res["price"] * 0.995)
-                                    pnl_eur = round((live_res["price"] - entry_p) * live_res["volume"] - fee_eur, 2)
+                                    succ, calc_pnl = self.db_manager.record_sell_trade(
+                                        timestamp=time.strftime("%H:%M:%S"),
+                                        pair=pair_name,
+                                        price=live_res["price"],
+                                        volume=live_res["volume"],
+                                        fee_eur=fee_eur,
+                                        txid=txid,
+                                        status=f"🔴 LIVE EXECUTED ({txid})"
+                                    )
+                                    pnl_eur = round(calc_pnl if calc_pnl is not None else 0.0, 4)
                                     self.cumulative_live_pnl += pnl_eur
                                     self.live_peak_prices[asset_code] = 0.0
-                                    self.live_entry_prices[asset_code] = 0.0
+                                    # Hole aktualisierten Einstiegspreis verbleibender Lots
+                                    rem_lots = self.db_manager.fetch_open_lots(pair_name)
+                                    self.live_entry_prices[asset_code] = rem_lots[-1]["entry_price"] if rem_lots else 0.0
 
                                 rec = {
                                     "timestamp": time.strftime("%H:%M:%S"),
@@ -789,23 +841,11 @@ class MultiExchangeTraderApp:
                                     "volume": live_res["volume"],
                                     "fee_eur": fee_eur,
                                     "pnl_eur": pnl_eur,
-                                    "status": f"🔴 LIVE EXECUTED ({live_res['txid']})"
+                                    "status": f"🔴 LIVE EXECUTED ({txid})"
                                 }
 
-                                self.db_manager.record_trade(
-                                    timestamp=rec["timestamp"],
-                                    pair=pair_name,
-                                    side=rec["side"],
-                                    price=rec["price"],
-                                    volume=rec["volume"],
-                                    fee_eur=rec["fee_eur"],
-                                    pnl_eur=rec["pnl_eur"],
-                                    txid=live_res['txid'],
-                                    status=rec["status"]
-                                )
-
                                 self.root.after(0, lambda r=rec: self.add_trade_to_ledger(r))
-                                self.log_console(f"🚨 ECHTE KRAKEN AUTONOME ORDER ({pair_name})! TXID: {live_res['txid']}")
+                                self.log_console(f"🚨 ECHTE KRAKEN AUTONOME ORDER ({pair_name})! TXID: {txid}")
                                 self.last_logged_status[pair_name] = "SUCCESS"
 
                                 # Push-Benachrichtigung an Telegram & Discord senden
@@ -815,7 +855,7 @@ class MultiExchangeTraderApp:
                                     f"• Side: *{live_res['side']}*\n"
                                     f"• Preis: `{live_res['price']:.2f} €`\n"
                                     f"• Volumen: `{live_res['volume']:.6f}`\n"
-                                    f"• TXID: `{live_res['txid']}`\n"
+                                    f"• TXID: `{txid}`\n"
                                     f"• Status: *ERFOLGREICH AUSGEFÜHRT*"
                                 )
                                 NotificationManager.send_telegram_alert_async(self.tg_bot_token, self.tg_chat_id, alert_text)
@@ -823,6 +863,11 @@ class MultiExchangeTraderApp:
                             else:
                                 msg = live_res.get('message', '')
                                 code = live_res.get('code', '')
+                                OrderLifecycleTracker.transition(
+                                    intent.intent_id,
+                                    OrderLifecycleState.REJECTED,
+                                    reason=f"{code}: {msg}"
+                                )
                                 lower_msg = str(msg).lower()
                                 if (code in ["INSUFFICIENT_FUNDS", "VOLUME_BELOW_MIN", "COST_BELOW_MIN"] or 
                                     "insufficient" in lower_msg or 
@@ -837,6 +882,29 @@ class MultiExchangeTraderApp:
                                 elif self.last_logged_status.get(pair_name) != msg:
                                     self.log_console(f"ℹ️ STATUS ({pair_name}): {msg}")
                                     self.last_logged_status[pair_name] = msg
+                        else:
+                            # PAPER TRADING SIMULATION
+                            self.last_order_time_per_pair[pair_name] = now_tm
+                            sim_signal = {
+                                "allowed": True,
+                                "signal_type": order["side"],
+                                "volume": order["volume"],
+                                "stop_loss_price": order["price"] * 0.98,
+                                "take_profit_price": order["price"] * 1.03
+                            }
+                            bid_p = order["price"] * 0.9998
+                            ask_p = order["price"] * 1.0002
+                            paper_rec = self.paper_simulator.execute_paper_order(sim_signal, bid_p, ask_p)
+                            if paper_rec:
+                                OrderLifecycleTracker.transition(
+                                    intent.intent_id,
+                                    OrderLifecycleState.FILLED,
+                                    txid="PAPER-SIM",
+                                    filled_vol=paper_rec["volume"],
+                                    fee_eur=paper_rec["fee_eur"]
+                                )
+                                self.root.after(0, lambda r=paper_rec: self.add_trade_to_ledger(r))
+                                self.log_console(f"🧪 PAPER TRADE AUSGEFÜHRT: {paper_rec['side']} {paper_rec['volume']:.6f} {asset_code} @ {paper_rec['price']:.2f} € (PnL: {paper_rec['pnl_eur']:+.2f} €)")
 
                 ui_info = {
                     "m_prices": m_prices,

@@ -22,6 +22,8 @@ import urllib.parse
 import threading
 import sqlite3
 from typing import Dict, List, Optional, Tuple, Any
+from decimal import Decimal, ROUND_HALF_UP
+from dataclasses import dataclass
 import numpy as np
 
 try:
@@ -36,35 +38,378 @@ try:
 except ImportError:
     HAS_CCXT = False
 
+class OrderLifecycleState:
+    INTENT_CREATED = "INTENT_CREATED"
+    SUBMITTED = "SUBMITTED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
+
+@dataclass
+class OrderIntent:
+    intent_id: str
+    pair: str
+    side: str
+    volume: float
+    price: float
+    order_type: str
+    state: str
+    created_at: float
+    updated_at: float
+    txid: Optional[str] = None
+    filled_volume: float = 0.0
+    fee_eur: float = 0.0
+    reject_reason: Optional[str] = None
+
+
+class OrderLifecycleTracker:
+    """Thread-sicherer Order-Status- und Lifecycle-Tracker"""
+    _lock = threading.Lock()
+    _intents: Dict[str, OrderIntent] = {}
+
+    @classmethod
+    def create_intent(cls, pair: str, side: str, volume: float, price: float, order_type: str = "market") -> OrderIntent:
+        with cls._lock:
+            intent_id = f"INTENT-{int(time.time() * 1000)}-{pair}-{side}"
+            now = time.time()
+            intent = OrderIntent(
+                intent_id=intent_id,
+                pair=pair,
+                side=side.upper(),
+                volume=float(volume),
+                price=float(price),
+                order_type=order_type,
+                state=OrderLifecycleState.INTENT_CREATED,
+                created_at=now,
+                updated_at=now
+            )
+            cls._intents[intent_id] = intent
+            return intent
+
+    @classmethod
+    def transition(cls, intent_id: str, new_state: str, txid: Optional[str] = None, filled_vol: float = 0.0, fee_eur: float = 0.0, reason: Optional[str] = None) -> Optional[OrderIntent]:
+        with cls._lock:
+            if intent_id not in cls._intents:
+                return None
+            intent = cls._intents[intent_id]
+            intent.state = new_state
+            intent.updated_at = time.time()
+            if txid:
+                intent.txid = txid
+            if filled_vol > 0:
+                intent.filled_volume = filled_vol
+            if fee_eur > 0:
+                intent.fee_eur = fee_eur
+            if reason:
+                intent.reject_reason = reason
+            return intent
+
+    @classmethod
+    def get_intent(cls, intent_id: str) -> Optional[OrderIntent]:
+        with cls._lock:
+            return cls._intents.get(intent_id)
+
+
+class CentralAccountingEngine:
+    """
+    Zentrale mathematisch exakte Buchhaltungs-Engine:
+    - Verwendet Decimal-Arithmetik gegen Rundungsverluste.
+    - FIFO-Lot-Matching für exakte Zuordnung von Anschaffungskosten und Kaufgebühren.
+    - Mathematische Formel für Realized Net PnL:
+      Net PnL = Gross Proceeds - Sell Fee - (Allocated Cost Basis + Allocated Buy Fee)
+             = (Price_sell - Price_buy) * Volume - Buy_Fee - Sell_Fee
+    - Strikte Erkennung unbekannter Anschaffungskosten (cost_basis is None -> pnl = UNKNOWN).
+    """
+
+    @staticmethod
+    def to_decimal(val: Any) -> Decimal:
+        if isinstance(val, Decimal):
+            return val
+        return Decimal(str(val))
+
+    @classmethod
+    def match_fifo_lots(
+        cls, 
+        open_lots: List[Dict[str, Any]], 
+        sell_volume: float, 
+        sell_price: float, 
+        sell_fee: float
+    ) -> Dict[str, Any]:
+        """
+        Führt ein FIFO-Matching gegen offene Kauf-Lots durch.
+        Rückgabe:
+        - remaining_lots: verbleibende Lots
+        - closed_lots: zugeordnete Lots mit Anteilen
+        - gross_proceeds: Decimal
+        - allocated_cost_basis: Decimal
+        - allocated_buy_fee: Decimal
+        - sell_fee: Decimal
+        - net_pnl: Decimal oder None bei unvollständiger Historie
+        - status: 'RECONCILED' | 'UNKNOWN_COST_BASIS' | 'PARTIAL_COST_BASIS'
+        """
+        sell_vol_dec = cls.to_decimal(sell_volume)
+        sell_price_dec = cls.to_decimal(sell_price)
+        sell_fee_dec = cls.to_decimal(sell_fee)
+
+        gross_proceeds = sell_vol_dec * sell_price_dec
+
+        if not open_lots or sum(cls.to_decimal(l["volume_remaining"]) for l in open_lots) < sell_vol_dec:
+            # Fehlende Kauf-Historie: Nicht spekulieren oder 0.995 annehmen!
+            return {
+                "remaining_lots": open_lots,
+                "closed_lots": [],
+                "gross_proceeds": gross_proceeds,
+                "allocated_cost_basis": None,
+                "allocated_buy_fee": None,
+                "sell_fee": sell_fee_dec,
+                "net_pnl": None,
+                "status": "UNKNOWN_COST_BASIS"
+            }
+
+        vol_to_close = sell_vol_dec
+        allocated_cost = Decimal("0")
+        allocated_buy_fee = Decimal("0")
+        remaining_lots = []
+        closed_lots = []
+
+        for lot in open_lots:
+            lot_rem = cls.to_decimal(lot["volume_remaining"])
+            lot_orig_vol = cls.to_decimal(lot.get("original_volume", lot_rem))
+            lot_price = cls.to_decimal(lot["entry_price"])
+            lot_fee = cls.to_decimal(lot.get("fee_allocated", 0.0))
+
+            if vol_to_close <= Decimal("0"):
+                remaining_lots.append(dict(lot))
+                continue
+
+            take_vol = min(vol_to_close, lot_rem)
+            # Proportionale Gebührenallokation
+            proportional_buy_fee = (take_vol / lot_orig_vol) * lot_fee if lot_orig_vol > 0 else Decimal("0")
+            proportional_cost = take_vol * lot_price
+
+            allocated_cost += proportional_cost
+            allocated_buy_fee += proportional_buy_fee
+
+            new_rem = lot_rem - take_vol
+            if new_rem > Decimal("1e-12"):
+                updated_lot = dict(lot)
+                updated_lot["volume_remaining"] = float(new_rem)
+                remaining_lots.append(updated_lot)
+            
+            closed_lots.append({
+                "lot_id": lot.get("lot_id", "LOT_UNKNOWN"),
+                "closed_volume": float(take_vol),
+                "entry_price": float(lot_price),
+                "allocated_cost": float(proportional_cost),
+                "allocated_buy_fee": float(proportional_buy_fee)
+            })
+
+            vol_to_close -= take_vol
+
+        # Formel: Net PnL = Gross Proceeds - Sell Fee - (Allocated Cost + Allocated Buy Fee)
+        net_pnl = gross_proceeds - sell_fee_dec - (allocated_cost + allocated_buy_fee)
+
+        return {
+            "remaining_lots": remaining_lots,
+            "closed_lots": closed_lots,
+            "gross_proceeds": gross_proceeds,
+            "allocated_cost_basis": allocated_cost,
+            "allocated_buy_fee": allocated_buy_fee,
+            "sell_fee": sell_fee_dec,
+            "net_pnl": net_pnl,
+            "status": "RECONCILED"
+        }
+
+    @classmethod
+    def calculate_realized_net_pnl(
+        cls, 
+        buy_price: float, 
+        sell_price: float, 
+        volume: float, 
+        buy_fee: float, 
+        sell_fee: float
+    ) -> Decimal:
+        """
+        Synthetische exakte Realized Net PnL Berechnung:
+        Net PnL = (Price_sell - Price_buy) * Volume - Fee_buy - Fee_sell
+        """
+        p_buy = cls.to_decimal(buy_price)
+        p_sell = cls.to_decimal(sell_price)
+        vol = cls.to_decimal(volume)
+        f_buy = cls.to_decimal(buy_fee)
+        f_sell = cls.to_decimal(sell_fee)
+
+        gross_proceeds = p_sell * vol
+        cost_basis = p_buy * vol
+        return gross_proceeds - f_sell - (cost_basis + f_buy)
+
+
 class SQLiteTradeLedgerManager:
-    """Persistentes Handelsjournal & PnL-Verwaltung in einer SQLite-Datenbank"""
+    """Persistentes Handelsjournal & PnL-Verwaltung in einer SQLite-Datenbank mit FIFO-Tax-Lots"""
 
     def __init__(self, db_path: str = "trading_ledger.db"):
         self.db_path = db_path
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    pair TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    volume REAL NOT NULL,
-                    fee_eur REAL NOT NULL,
-                    pnl_eur REAL NOT NULL,
-                    txid TEXT NOT NULL,
-                    status TEXT NOT NULL
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                # Trades-Tabelle mit strikten Finanzspalten
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        pair TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        volume REAL NOT NULL,
+                        fee_eur REAL NOT NULL,
+                        pnl_eur REAL NOT NULL,
+                        txid TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        gross_proceeds REAL DEFAULT 0.0,
+                        cost_basis REAL DEFAULT 0.0,
+                        allocated_buy_fee REAL DEFAULT 0.0,
+                        lot_id TEXT DEFAULT NULL
+                    )
+                """)
+                # Tax-Lots Tabelle für FIFO
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS open_lots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        lot_id TEXT UNIQUE NOT NULL,
+                        pair TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        entry_price REAL NOT NULL,
+                        original_volume REAL NOT NULL,
+                        volume_remaining REAL NOT NULL,
+                        fee_allocated REAL NOT NULL
+                    )
+                """)
+                conn.commit()
+                # Schema Migration (falls Spalten in alter DB fehlen)
+                cursor.execute("PRAGMA table_info(trades)")
+                cols = [c[1] for c in cursor.fetchall()]
+                if "gross_proceeds" not in cols:
+                    cursor.execute("ALTER TABLE trades ADD COLUMN gross_proceeds REAL DEFAULT 0.0")
+                if "cost_basis" not in cols:
+                    cursor.execute("ALTER TABLE trades ADD COLUMN cost_basis REAL DEFAULT 0.0")
+                if "allocated_buy_fee" not in cols:
+                    cursor.execute("ALTER TABLE trades ADD COLUMN allocated_buy_fee REAL DEFAULT 0.0")
+                if "lot_id" not in cols:
+                    cursor.execute("ALTER TABLE trades ADD COLUMN lot_id TEXT DEFAULT NULL")
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+    def record_buy_trade(
+        self,
+        timestamp: str,
+        pair: str,
+        price: float,
+        volume: float,
+        fee_eur: float,
+        txid: str,
+        status: str,
+        lot_id: Optional[str] = None
+    ) -> bool:
+        """Zeichnet einen Kauf auf und legt einen offenen FIFO Tax-Lot an"""
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                actual_lot_id = lot_id or f"LOT-{txid}-{int(time.time()*1000)}"
+                cost_basis = float(price) * float(volume)
+                cursor.execute("""
+                    INSERT INTO trades (timestamp, pair, side, price, volume, fee_eur, pnl_eur, txid, status, gross_proceeds, cost_basis, allocated_buy_fee, lot_id)
+                    VALUES (?, ?, 'BUY', ?, ?, ?, 0.0, ?, ?, 0.0, ?, ?, ?)
+                """, (str(timestamp), str(pair), float(price), float(volume), float(fee_eur), str(txid), str(status), cost_basis, float(fee_eur), actual_lot_id))
+                
+                cursor.execute("""
+                    INSERT INTO open_lots (lot_id, pair, timestamp, entry_price, original_volume, volume_remaining, fee_allocated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (actual_lot_id, str(pair), str(timestamp), float(price), float(volume), float(volume), float(fee_eur)))
+                
+                conn.commit()
+                conn.close()
+                return True
+            except Exception:
+                return False
+
+    def record_sell_trade(
+        self,
+        timestamp: str,
+        pair: str,
+        price: float,
+        volume: float,
+        fee_eur: float,
+        txid: str,
+        status: str
+    ) -> Tuple[bool, Optional[float]]:
+        """
+        Führt FIFO-Matching gegen offene Lots durch und berechnet exakte Netto-PnL.
+        Gibt (success, net_pnl_eur) zurück.
+        """
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                cursor.execute("SELECT * FROM open_lots WHERE pair = ? AND volume_remaining > 1e-12 ORDER BY id ASC", (pair,))
+                raw_lots = [dict(row) for row in cursor.fetchall()]
+
+                match_res = CentralAccountingEngine.match_fifo_lots(
+                    open_lots=raw_lots,
+                    sell_volume=volume,
+                    sell_price=price,
+                    sell_fee=fee_eur
                 )
-            """)
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+
+                gross_proceeds = float(match_res["gross_proceeds"])
+                sell_fee = float(match_res["sell_fee"])
+
+                if match_res["status"] == "UNKNOWN_COST_BASIS":
+                    # Unbekannter Anschaffungspreis: Kein künstlicher Gewinn!
+                    net_pnl = 0.0
+                    cost_basis = 0.0
+                    allocated_buy_fee = 0.0
+                    status_note = f"{status} [UNKNOWN_COST_BASIS]"
+                else:
+                    net_pnl = float(match_res["net_pnl"])
+                    cost_basis = float(match_res["allocated_cost_basis"])
+                    allocated_buy_fee = float(match_res["allocated_buy_fee"])
+                    status_note = status
+
+                    # Aktualisiere/Schließe Lots in DB
+                    for cl in match_res["closed_lots"]:
+                        cursor.execute("SELECT volume_remaining FROM open_lots WHERE lot_id = ?", (cl["lot_id"],))
+                        row = cursor.fetchone()
+                        if row:
+                            new_rem = max(0.0, float(row["volume_remaining"]) - cl["closed_volume"])
+                            cursor.execute("UPDATE open_lots SET volume_remaining = ? WHERE lot_id = ?", (new_rem, cl["lot_id"]))
+
+                cursor.execute("""
+                    INSERT INTO trades (timestamp, pair, side, price, volume, fee_eur, pnl_eur, txid, status, gross_proceeds, cost_basis, allocated_buy_fee, lot_id)
+                    VALUES (?, ?, 'SELL', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    str(timestamp), str(pair), float(price), float(volume), float(sell_fee),
+                    net_pnl, str(txid), status_note, gross_proceeds, cost_basis, allocated_buy_fee, "CLOSED_FIFO"
+                ))
+
+                conn.commit()
+                conn.close()
+                return True, (net_pnl if match_res["status"] != "UNKNOWN_COST_BASIS" else None)
+            except Exception:
+                return False, None
 
     def record_trade(
         self, 
@@ -78,55 +423,74 @@ class SQLiteTradeLedgerManager:
         txid: str, 
         status: str
     ) -> bool:
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO trades (timestamp, pair, side, price, volume, fee_eur, pnl_eur, txid, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (str(timestamp), str(pair), str(side), float(price), float(volume), float(fee_eur), float(pnl_eur), str(txid), str(status)))
-            conn.commit()
-            conn.close()
-            return True
-        except Exception:
-            return False
+        """Legacy-Kompatibilitätsmethode mit Weiterleitung an FIFO"""
+        if side.upper() == "BUY":
+            return self.record_buy_trade(timestamp, pair, price, volume, fee_eur, txid, status)
+        elif side.upper() == "SELL":
+            succ, _ = self.record_sell_trade(timestamp, pair, price, volume, fee_eur, txid, status)
+            return succ
+        return False
+
+    def fetch_open_lots(self, pair: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM open_lots WHERE pair = ? AND volume_remaining > 1e-12 ORDER BY id ASC", (pair,))
+                res = [dict(r) for r in cursor.fetchall()]
+                conn.close()
+                return res
+            except Exception:
+                return []
 
     def fetch_all_trades(self) -> List[Dict[str, Any]]:
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT timestamp, side, price, volume, fee_eur, pnl_eur, status FROM trades ORDER BY id DESC LIMIT 500")
-            rows = cursor.fetchall()
-            res = [dict(row) for row in rows]
-            conn.close()
-            return res
-        except Exception:
-            return []
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT timestamp, side, price, volume, fee_eur, pnl_eur, status, txid FROM trades ORDER BY id DESC LIMIT 500")
+                rows = cursor.fetchall()
+                res = [dict(row) for row in rows]
+                conn.close()
+                return res
+            except Exception:
+                return []
 
     def fetch_cumulative_pnl(self) -> float:
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT SUM(pnl_eur) FROM trades")
-            res = cursor.fetchone()
-            val = float(res[0]) if res and res[0] is not None else 0.0
-            conn.close()
-            return val
-        except Exception:
-            return 0.0
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT SUM(pnl_eur) FROM trades WHERE side = 'SELL'")
+                res = cursor.fetchone()
+                val = float(res[0]) if res and res[0] is not None else 0.0
+                conn.close()
+                return val
+            except Exception:
+                return 0.0
 
     def fetch_last_buy_price(self, pair: str) -> Optional[float]:
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT price FROM trades WHERE pair = ? AND side = 'BUY' ORDER BY id DESC LIMIT 1", (pair,))
-            res = cursor.fetchone()
-            val = float(res[0]) if res and res[0] is not None else None
-            conn.close()
-            return val
-        except Exception:
-            return None
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                # Zuerst aus offenen Lots
+                cursor.execute("SELECT entry_price FROM open_lots WHERE pair = ? AND volume_remaining > 1e-12 ORDER BY id DESC LIMIT 1", (pair,))
+                res = cursor.fetchone()
+                if res and res[0] is not None:
+                    val = float(res[0])
+                    conn.close()
+                    return val
+                # Fallback auf historische Trades
+                cursor.execute("SELECT price FROM trades WHERE pair = ? AND side = 'BUY' ORDER BY id DESC LIMIT 1", (pair,))
+                res = cursor.fetchone()
+                val = float(res[0]) if res and res[0] is not None else None
+                conn.close()
+                return val
+            except Exception:
+                return None
 
 
 class KrakenLiveGateway:
@@ -503,14 +867,14 @@ class MultiAssetWalletAllocator:
                     tp_dist_pct = 0.030
 
                 # Mindestpreis für garantierten Netto-Gewinn
-                fee_threshold_price = entry_p * (1.0 + roundtrip_fee_pct + min_net_profit_pct)
+                fee_threshold_price = entry_p * (1.0 + roundtrip_fee_pct + min_net_profit_pct) if entry_p > 0 else float('inf')
 
                 if entry_p > 0:
                     gross_ret = (price - entry_p) / entry_p
                     peak_ret = (peak_p - entry_p) / entry_p
                     pullback_from_peak = (peak_p - price) / peak_p if peak_p > 0 else 0.0
 
-                    # 1. DYNAMISCHER TRAILING PROFIT LOCK (Gewinne sichern ab +1.5% Peak)
+                    # 1. DYNAMISCHER TRAILING PROFIT LOCK (PROFIT_EXIT: Gewinne sichern ab +1.5% Peak)
                     if peak_ret >= 0.015 and pullback_from_peak >= 0.004 and price >= fee_threshold_price:
                         executable_orders.append({
                             "pair": pair,
@@ -518,35 +882,38 @@ class MultiAssetWalletAllocator:
                             "asset": asset,
                             "volume": bal * 0.999,
                             "price": price,
+                            "exit_type": "PROFIT_EXIT",
                             "reason": f"💰 Trailing Profit Lock (+{gross_ret*100:.2f}% Brutto, Peak: {peak_p:.2f} €) für {asset}"
                         })
                         continue
 
-                    # 2. RATCHET BREAK-EVEN ABSICHERUNG (Verhindert, dass Gewinner zu Verlierern werden)
-                    if peak_ret >= 0.0080 and price <= entry_p * (1.0 + roundtrip_fee_pct + 0.0010) and price >= entry_p * 1.002:
+                    # 2. RATCHET BREAK-EVEN ABSICHERUNG (PROFIT_EXIT: Verhindert, dass Gewinner zu Verlierern werden)
+                    if peak_ret >= 0.0080 and price <= entry_p * (1.0 + roundtrip_fee_pct + 0.0010) and price >= fee_threshold_price:
                         executable_orders.append({
                             "pair": pair,
                             "side": "SELL",
                             "asset": asset,
                             "volume": bal * 0.999,
                             "price": price,
+                            "exit_type": "PROFIT_EXIT",
                             "reason": f"🛡️ Ratchet Break-Even Absicherung (+{gross_ret*100:.2f}% Gewinn gesichert) für {asset}"
                         })
                         continue
 
-                    # 3. TAKE-PROFIT ZIEL
-                    if price >= entry_p * (1.0 + tp_dist_pct):
+                    # 3. TAKE-PROFIT ZIEL (PROFIT_EXIT)
+                    if price >= entry_p * (1.0 + tp_dist_pct) and price >= fee_threshold_price:
                         executable_orders.append({
                             "pair": pair,
                             "side": "SELL",
                             "asset": asset,
                             "volume": bal * 0.999,
                             "price": price,
+                            "exit_type": "PROFIT_EXIT",
                             "reason": f"🎯 Take-Profit Ziel (+{gross_ret*100:.2f}%) für {asset} [{curr_regime}]"
                         })
                         continue
 
-                    # 4. EXTREMER NOTFALL-CIRCUIT-BREAKER (Nur bei extremem Crash > -5.0%)
+                    # 4. EXTREMER NOTFALL-CIRCUIT-BREAKER (RISK_EXIT: Nur bei extremem Crash > -5.0%)
                     if price <= entry_p * 0.950:
                         executable_orders.append({
                             "pair": pair,
@@ -554,14 +921,15 @@ class MultiAssetWalletAllocator:
                             "asset": asset,
                             "volume": bal * 0.999,
                             "price": price,
+                            "exit_type": "RISK_EXIT",
                             "reason": f"🚨 Notfall-Stop Schutz (-{sl_dist_pct*100:.1f}%) für {asset}"
                         })
                         continue
 
-                # 5. STANDARD SIGNAL SELL (NUR ERLAUBT WENN NETTO-GEWINN GARANTIERT IST!)
+                # 5. STANDARD SIGNAL SELL (PROFIT_EXIT: NUR ERLAUBT WENN NETTO-GEWINN GARANTIERT IST & ENTRY PREIS BEKANNT IST!)
                 if signal == "SELL":
-                    # Strenges Gebot: Ein Verkauf erfolgt NUR, wenn der Preis über dem Kaufpreis + Gebühren liegt!
-                    if entry_p == 0 or price >= fee_threshold_price:
+                    # Strenges Gebot: Ein Profit-Verkauf erfolgt NUR wenn entry_p > 0 und Preis über Kaufpreis + Gebühren liegt!
+                    if entry_p > 0 and price >= fee_threshold_price:
                         if obi_val <= 0.10:
                             executable_orders.append({
                                 "pair": pair,
@@ -569,7 +937,8 @@ class MultiAssetWalletAllocator:
                                 "asset": asset,
                                 "volume": bal * 0.999,
                                 "price": price,
-                                "reason": f"💰 Autonomer Gewinn-Verkauf {asset} (+{((price - entry_p)/entry_p*100) if entry_p > 0 else 0:.2f}% Netto-Plus)"
+                                "exit_type": "PROFIT_EXIT",
+                                "reason": f"💰 Autonomer Gewinn-Verkauf {asset} (+{((price - entry_p)/entry_p*100):.2f}% Netto-Plus)"
                             })
 
         # 2. HIGH-CONVICTION BUYING (Streng selektives Einstiegs-Gating & Kapitalerhalt)
@@ -1030,10 +1399,27 @@ class PaperTradingSimulator:
             self.eur_balance += proceeds
 
             pnl_eur = 0.0
-            if self.positions:
-                pos = self.positions.pop(0)
-                cost = pos["volume"] * pos["entry_price"] + pos["fee_paid"]
-                pnl_eur = proceeds - cost
+            vol_to_match = sell_vol
+            cost_basis = 0.0
+            allocated_buy_fee = 0.0
+
+            while self.positions and vol_to_match > 1e-12:
+                pos = self.positions[0]
+                matched_vol = min(vol_to_match, pos["volume"])
+                ratio = matched_vol / pos["volume"] if pos["volume"] > 0 else 0.0
+                
+                cost_basis += matched_vol * pos["entry_price"]
+                allocated_buy_fee += ratio * pos["fee_paid"]
+                
+                pos["volume"] -= matched_vol
+                pos["fee_paid"] -= (ratio * pos["fee_paid"])
+                vol_to_match -= matched_vol
+                
+                if pos["volume"] <= 1e-12:
+                    self.positions.pop(0)
+
+            if cost_basis > 0:
+                pnl_eur = proceeds - (cost_basis + allocated_buy_fee)
                 self.realized_pnl_eur += pnl_eur
                 if pnl_eur > 0:
                     self.winning_trades += 1

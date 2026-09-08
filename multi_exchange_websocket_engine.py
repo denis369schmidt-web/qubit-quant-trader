@@ -94,10 +94,10 @@ class MultiExchangeWebSocketManager:
             t.start()
 
     def _run_multi_asset_ticker_loop(self):
-        """Holt kontinuierlich echte Live-Preise für BTC, XRP, ETH und SOL"""
+        """Holt kontinuierlich echte Live-Preise für BTC, XRP, ETH und SOL in EUR"""
         while self.running:
             try:
-                url = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD,XRPUSD,ETHUSD,SOLUSD"
+                url = "https://api.kraken.com/0/public/Ticker?pair=XBTEUR,XRPEUR,ETHEUR,SOLEUR"
                 req = urllib.request.Request(url, headers={'User-Agent': 'InstitutionalMultiAssetFeed/2026'})
                 with urllib.request.urlopen(req, timeout=3.0) as resp:
                     res = json.loads(resp.read().decode('utf-8'))
