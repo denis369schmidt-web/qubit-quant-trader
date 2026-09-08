@@ -1,4 +1,4 @@
-﻿"""
+"""
 SYNTHETISCHE REGRESSIONSTEST-SUITE: FINANZ-BUCHHALTUNG & PNL-VALIDIERUNG
 """
 
@@ -188,6 +188,87 @@ class TestPnLRegression(unittest.TestCase):
         )
         profit_exits = [o for o in orders if o.get("exit_type") == "PROFIT_EXIT"]
         self.assertEqual(len(profit_exits), 0)
+
+    # ---------------------------------------------------------------
+    # PFLICHT-TESTFALL AUS DER SPEZIFIKATION (Sektion 2, P0-Niveau)
+    # Kauf 1 Einheit @ 100 EUR, Kaufgebühr 0,26 EUR.
+    # Verkauf 1 Einheit @ 100,40 EUR, Verkaufsgebühr 0,26104 EUR.
+    # Erwarteter Netto-PnL: -0,12104 EUR.
+    # ---------------------------------------------------------------
+    def test_spec_mandatory_pnl_calculation(self):
+        """Pflicht-Testfall aus der Spezifikation P0-Sektion 2.
+        Kauf 1 Einheit @ 100 EUR, Kaufgebühr 0,26 EUR.
+        Verkauf 1 Einheit @ 100,40 EUR, Verkaufsgebühr 0,26104 EUR.
+        Erwarteter Netto-PnL: -0,12104 EUR (Verlust trotz positivem Rohertrag,
+        da Gesamtgebühren den Kursgewinn übersteigen).
+        """
+        pnl = CentralAccountingEngine.calculate_realized_net_pnl(
+            buy_price=100.0,
+            sell_price=100.40,
+            volume=1.0,
+            buy_fee=0.26,
+            sell_fee=0.26104
+        )
+        # Berechnung:
+        # Bruttoerlös: 100.40
+        # Einstandskosten (Kauf + Gebühr): 100.00 + 0.26 = 100.26
+        # Abzgl. Verkaufsgebühr: 100.40 - 0.26104 = 100.13896
+        # Net PnL = 100.13896 - 100.26 = -0.12104
+        self.assertAlmostEqual(float(pnl), -0.12104, places=5,
+                               msg="Pflicht-Testfall fehlgeschlagen: Netto-PnL sollte -0,12104 EUR betragen")
+        self.assertLess(float(pnl), 0.0,
+                        msg="Pflicht-Testfall fehlgeschlagen: Trade muss Netto-Verlust ergeben")
+
+    def test_spec_mandatory_pnl_db_round_trip(self):
+        """Pflicht-Testfall als vollständiger Datenbank-Round-Trip.
+        Verifiziert, dass der berechnete PnL nach Persistenz in SQLite korrekt ist
+        und dass record_sell_trade bei UNKNOWN_COST_BASIS None (nicht 0.0) zurückgibt.
+        """
+        # BUY: 1 Einheit @ 100 EUR, Gebühr 0,26 EUR
+        succ = self.ledger.record_buy_trade(
+            timestamp="10:00:00",
+            pair="XBTEUR",
+            price=100.0,
+            volume=1.0,
+            fee_eur=0.26,
+            txid="TX-SPEC-BUY",
+            status="EXECUTED"
+        )
+        self.assertTrue(succ, "record_buy_trade sollte True zurückgeben")
+
+        # SELL: 1 Einheit @ 100,40 EUR, Gebühr 0,26104 EUR
+        succ2, pnl = self.ledger.record_sell_trade(
+            timestamp="10:05:00",
+            pair="XBTEUR",
+            price=100.40,
+            volume=1.0,
+            fee_eur=0.26104,
+            txid="TX-SPEC-SELL",
+            status="EXECUTED"
+        )
+        self.assertTrue(succ2, "record_sell_trade sollte True zurückgeben")
+        self.assertIsNotNone(pnl, "PnL darf nicht None sein wenn ein Lot existiert")
+        self.assertAlmostEqual(float(pnl), -0.12104, places=5,
+                               msg=f"DB-Round-Trip PnL falsch: erwartet -0.12104, erhalten {pnl}")
+
+    def test_unknown_cost_basis_returns_none_not_zero(self):
+        """P0-Sicherheitstest: record_sell_trade muss None (nicht 0.0) zurückgeben
+        wenn kein offenes Lot existiert (UNKNOWN_COST_BASIS-Szenario).
+        """
+        # KEIN record_buy_trade vorher → kein Lot in der Datenbank
+        succ, pnl = self.ledger.record_sell_trade(
+            timestamp="10:00:00",
+            pair="SOLEUR",
+            price=150.0,
+            volume=1.0,
+            fee_eur=0.39,
+            txid="TX-ORPHAN-SELL",
+            status="EXECUTED"
+        )
+        self.assertTrue(succ, "record_sell_trade sollte auch bei UNKNOWN_COST_BASIS True zurückgeben")
+        self.assertIsNone(pnl,
+                          "UNKNOWN_COST_BASIS muss None zurückgeben, nicht 0.0 – "
+                          "sonst wird ein fiktiver Gewinn im kumulativen PnL verbucht")
 
 if __name__ == "__main__":
     unittest.main()

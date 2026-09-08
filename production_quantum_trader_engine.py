@@ -61,27 +61,105 @@ HSM_VAULT_PATH = os.path.join(os.getcwd(), ".kraken_hsm_vault.json")
 
 
 class EncryptedCredentialVault:
+    """
+    Fernet-AES128-CBC + HMAC-SHA256 vault.
+    Key is derived from the Windows Machine GUID via PBKDF2-HMAC-SHA256.
+    The raw key never touches disk.  Old base64-obfuscated vaults are
+    detected and transparently migrated on first load.
+    """
+
+    _VAULT_FORMAT_VERSION = 2
+    _PBKDF2_ITERATIONS = 260_000
+    _SALT = b"qubit_vault_v2_salt_2026"   # public, fixed per-app salt
+
+    # ------------------------------------------------------------------
+    # Key derivation
+    # ------------------------------------------------------------------
     @staticmethod
-    def _obfuscate(text: str) -> str:
-        return base64.b64encode(hashlib.sha256(text.encode()).digest() + text.encode()).decode()
+    def _machine_secret() -> bytes:
+        """Derive a stable machine-specific secret from the Windows Machine GUID."""
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography"
+            ) as k:
+                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
+                return guid.encode()
+        except Exception:
+            # Fallback: hostname + username (still machine-specific, less unique)
+            import socket
+            return (socket.gethostname() + os.environ.get("USERNAME", "user")).encode()
 
     @staticmethod
-    def _deobfuscate(encoded_str: str) -> str:
+    def _derive_fernet_key() -> bytes:
+        """Return a URL-safe base64-encoded 32-byte Fernet key."""
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes as _hashes
+        from cryptography.hazmat.backends import default_backend
+        kdf = PBKDF2HMAC(
+            algorithm=_hashes.SHA256(),
+            length=32,
+            salt=EncryptedCredentialVault._SALT,
+            iterations=EncryptedCredentialVault._PBKDF2_ITERATIONS,
+            backend=default_backend()
+        )
+        raw = kdf.derive(EncryptedCredentialVault._machine_secret())
+        return base64.urlsafe_b64encode(raw)
+
+    # ------------------------------------------------------------------
+    # Encryption helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _encrypt(text: str) -> str:
+        from cryptography.fernet import Fernet
+        f = Fernet(EncryptedCredentialVault._derive_fernet_key())
+        return f.encrypt(text.encode()).decode()
+
+    @staticmethod
+    def _decrypt(token: str) -> str:
+        from cryptography.fernet import Fernet, InvalidToken
+        try:
+            f = Fernet(EncryptedCredentialVault._derive_fernet_key())
+            return f.decrypt(token.encode()).decode()
+        except (InvalidToken, Exception):
+            return ""
+
+    # ------------------------------------------------------------------
+    # Legacy (v1) detection & migration
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_legacy(value: str) -> bool:
+        """Return True if this looks like old base64(sha256+plaintext) encoding."""
+        try:
+            raw = base64.b64decode(value.encode())
+            # Legacy tokens are exactly 32 (sha256) + len(plaintext) bytes,
+            # and are NOT valid Fernet tokens (which start with version byte 0x80).
+            return len(raw) >= 32 and raw[0] != 0x80
+        except Exception:
+            return False
+
+    @staticmethod
+    def _deobfuscate_legacy(encoded_str: str) -> str:
         try:
             raw = base64.b64decode(encoded_str.encode())
             return raw[32:].decode()
         except Exception:
             return ""
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     @staticmethod
     def save_vault(api_key: str, api_secret: str, tg_token: str = "", tg_chat: str = "", discord_url: str = "") -> bool:
         try:
             vault_data = {
-                "hsm_key": EncryptedCredentialVault._obfuscate(api_key),
-                "hsm_secret": EncryptedCredentialVault._obfuscate(api_secret),
-                "hsm_tg_token": EncryptedCredentialVault._obfuscate(tg_token),
-                "hsm_tg_chat": EncryptedCredentialVault._obfuscate(tg_chat),
-                "hsm_discord_url": EncryptedCredentialVault._obfuscate(discord_url),
+                "vault_format": EncryptedCredentialVault._VAULT_FORMAT_VERSION,
+                "hsm_key":         EncryptedCredentialVault._encrypt(api_key),
+                "hsm_secret":      EncryptedCredentialVault._encrypt(api_secret),
+                "hsm_tg_token":    EncryptedCredentialVault._encrypt(tg_token),
+                "hsm_tg_chat":     EncryptedCredentialVault._encrypt(tg_chat),
+                "hsm_discord_url": EncryptedCredentialVault._encrypt(discord_url),
                 "vault_timestamp": time.time()
             }
             with open(HSM_VAULT_PATH, "w", encoding="utf-8") as f:
@@ -92,19 +170,36 @@ class EncryptedCredentialVault:
 
     @staticmethod
     def load_vault() -> Tuple[str, str, str, str, str]:
-        if os.path.exists(HSM_VAULT_PATH):
-            try:
-                with open(HSM_VAULT_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    key = EncryptedCredentialVault._deobfuscate(data.get("hsm_key", ""))
-                    secret = EncryptedCredentialVault._deobfuscate(data.get("hsm_secret", ""))
-                    tg_token = EncryptedCredentialVault._deobfuscate(data.get("hsm_tg_token", ""))
-                    tg_chat = EncryptedCredentialVault._deobfuscate(data.get("hsm_tg_chat", ""))
-                    discord_url = EncryptedCredentialVault._deobfuscate(data.get("hsm_discord_url", ""))
-                    return key, secret, tg_token, tg_chat, discord_url
-            except Exception:
-                pass
-        return "", "", "", "", ""
+        if not os.path.exists(HSM_VAULT_PATH):
+            return "", "", "", "", ""
+        try:
+            with open(HSM_VAULT_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            def _read(field: str) -> str:
+                val = data.get(field, "")
+                if not val:
+                    return ""
+                # Transparent migration: v1 → v2
+                if EncryptedCredentialVault._is_legacy(val):
+                    return EncryptedCredentialVault._deobfuscate_legacy(val)
+                return EncryptedCredentialVault._decrypt(val)
+
+            result = (
+                _read("hsm_key"),
+                _read("hsm_secret"),
+                _read("hsm_tg_token"),
+                _read("hsm_tg_chat"),
+                _read("hsm_discord_url"),
+            )
+
+            # Auto-migrate v1 vault to v2 on first successful load
+            if data.get("vault_format", 1) < EncryptedCredentialVault._VAULT_FORMAT_VERSION:
+                EncryptedCredentialVault.save_vault(*result)
+
+            return result
+        except Exception:
+            return "", "", "", "", ""
 
 
 class MultiExchangeTraderApp:
@@ -140,6 +235,10 @@ class MultiExchangeTraderApp:
         self.real_equity_eur = 0.0
         self.initial_equity: Optional[float] = None
         self.cumulative_live_pnl: float = 0.0
+        # Pairs whose sells produced UNKNOWN_COST_BASIS (PnL = None from ledger).
+        # These are excluded from cumulative_live_pnl and block compounding.
+        self.unknown_pnl_pairs: set = set()
+        self._pnl_unknown_count: int = 0  # total unknown-cost-basis sell events
         self.last_arb_alert_time: float = 0.0
         self.last_order_time_per_pair: Dict[str, float] = {}
         self.last_logged_status: Dict[str, str] = {}
@@ -540,7 +639,7 @@ class MultiExchangeTraderApp:
         dialog.attributes("-topmost", True)
 
         tk.Label(dialog, text="🔐 Kraken API & Webhook Vault", bg="#111827", fg="#00ff88", font=("Segoe UI", 12, "bold")).pack(pady=(12, 4))
-        tk.Label(dialog, text="Schlüssel werden AES/HMAC-verschlüsselt lokal gespeichert", bg="#111827", fg="#64748b", font=("Segoe UI", 8)).pack(pady=(0, 8))
+        tk.Label(dialog, text="Schlüssel werden mit Fernet (AES-128-CBC + HMAC-SHA256) verschlüsselt, Schlüssel aus Machine-GUID abgeleitet", bg="#111827", fg="#64748b", font=("Segoe UI", 8)).pack(pady=(0, 8))
 
         # Kraken API
         tk.Label(dialog, text="Kraken API Key:", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=30, pady=(4, 1))
@@ -694,11 +793,17 @@ class MultiExchangeTraderApp:
                     self.initial_equity = self.real_equity_eur
 
                 base_eq = self.initial_equity if (self.initial_equity and self.initial_equity > 0) else max(self.real_equity_eur, 50.0)
-                compounding_mult = AutoCompoundingEngine.calculate_compounding_multiplier(
-                    cumulative_pnl_eur=self.cumulative_live_pnl,
-                    base_equity_eur=base_eq,
-                    compounding_rate=0.5
-                )
+                # P0-A: Block compounding when any pair has unresolved cost basis.
+                # Using cumulative_live_pnl that excludes UNKNOWN events is correct,
+                # but we still gate the multiplier at 1.0 as an additional safety layer.
+                if self.unknown_pnl_pairs:
+                    compounding_mult = 1.0
+                else:
+                    compounding_mult = AutoCompoundingEngine.calculate_compounding_multiplier(
+                        cumulative_pnl_eur=self.cumulative_live_pnl,
+                        base_equity_eur=base_eq,
+                        compounding_rate=0.5
+                    )
 
                 # Cross-Exchange Arbitrage Radar (Kraken, Binance, Coinbase, Bybit)
                 arb_res = CrossExchangeArbitrageEngine.detect_cross_exchange_spread(m_prices)
@@ -716,11 +821,18 @@ class MultiExchangeTraderApp:
                     if p_val > 0 and p_val > self.live_peak_prices.get(a_code, 0.0):
                         self.live_peak_prices[a_code] = p_val
 
-                # VOLLAUTONOMER MULTI-ASSET WALLET ALLOCATOR (Nutzt 100% aller Wallet-Bestände + Guaranteed-Profit Guard + Trailing Profit Locks + Auto-Compounding)
+                # P0-C: PAPER-Modus nutzt isoliertes Paper-Portfolio, nicht echte Wallet-Bestände.
+                # LIVE-Modus nutzt self.real_balances (echte Kraken-Salden).
+                if self.trading_mode == "PAPER":
+                    allocator_balances = self.paper_simulator.get_balances()
+                else:
+                    allocator_balances = self.real_balances
+
+                # VOLLAUTONOMER MULTI-ASSET WALLET ALLOCATOR (Guaranteed-Profit Guard + Trailing Profit Locks + Auto-Compounding)
                 executable_orders = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
-                    self.real_balances, 
-                    asset_signals, 
-                    live_asset_prices, 
+                    allocator_balances,
+                    asset_signals,
+                    live_asset_prices,
                     rsi_scores=rsi_dict,
                     obi_scores=obi_dict,
                     entry_prices=self.live_entry_prices,
@@ -827,8 +939,21 @@ class MultiExchangeTraderApp:
                                         txid=txid,
                                         status=f"🔴 LIVE EXECUTED ({txid})"
                                     )
-                                    pnl_eur = round(calc_pnl if calc_pnl is not None else 0.0, 4)
-                                    self.cumulative_live_pnl += pnl_eur
+                                    if calc_pnl is not None:
+                                        # Known cost basis: safe to include in cumulative PnL
+                                        pnl_eur = round(float(calc_pnl), 4)
+                                        self.cumulative_live_pnl += pnl_eur
+                                    else:
+                                        # P0-A: UNKNOWN_COST_BASIS — do NOT add to cumulative PnL.
+                                        # Flag pair so compounding is blocked and GUI shows warning.
+                                        pnl_eur = None
+                                        self.unknown_pnl_pairs.add(pair_name)
+                                        self._pnl_unknown_count += 1
+                                        self.log_console(
+                                            f"⚠️ PnL UNBEKANNT ({pair_name}): Kein Einstiegspreis-Lot vorhanden. "
+                                            f"Abstimmung erforderlich! "
+                                            f"({self._pnl_unknown_count} ungelöste Ereignisse)"
+                                        )
                                     self.live_peak_prices[asset_code] = 0.0
                                     # Hole aktualisierten Einstiegspreis verbleibender Lots
                                     rem_lots = self.db_manager.fetch_open_lots(pair_name)
@@ -840,7 +965,7 @@ class MultiExchangeTraderApp:
                                     "price": live_res["price"],
                                     "volume": live_res["volume"],
                                     "fee_eur": fee_eur,
-                                    "pnl_eur": pnl_eur,
+                                    "pnl_eur": pnl_eur if pnl_eur is not None else "UNBEKANNT – Abstimmung",
                                     "status": f"🔴 LIVE EXECUTED ({txid})"
                                 }
 

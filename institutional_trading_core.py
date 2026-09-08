@@ -1442,6 +1442,18 @@ class PaperTradingSimulator:
     def get_portfolio_equity(self, current_price: float) -> float:
         return self.eur_balance + (self.asset_balance * current_price)
 
+    def get_balances(self) -> Dict[str, float]:
+        """Return paper portfolio balances in the same format as real_balances.
+        The paper simulator tracks a single generic asset; exposed as 'BTC' so
+        the allocator can apply minimum-lot size checks consistently."""
+        return {
+            "EUR": self.eur_balance,
+            "BTC": self.asset_balance,   # paper generic asset
+            "XRP": 0.0,
+            "ETH": 0.0,
+            "SOL": 0.0,
+        }
+
 
 class QuantitativeRegimeClassifier:
     """Machine Learning & Statistisches Regime Detection Modell (Trend vs. Mean-Reversion)"""
