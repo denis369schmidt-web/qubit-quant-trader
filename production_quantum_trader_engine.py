@@ -813,12 +813,30 @@ class MultiExchangeTraderApp:
                     rsi_sell_thresh = regime_res.get("rsi_sell", 60)
                     z_thresh = 1.5
 
-                asset_signals = {
-                    "BTC": "BUY" if (rsi_btc < rsi_buy_thresh or z_score <= -z_thresh) else "SELL" if (rsi_btc > rsi_sell_thresh or z_score >= z_thresh) else "HOLD",
-                    "XRP": "SELL" if (rsi_xrp > rsi_sell_thresh) else "BUY" if (rsi_xrp < rsi_buy_thresh) else "HOLD",
-                    "ETH": "SELL" if (rsi_eth > rsi_sell_thresh) else "BUY" if (rsi_eth < rsi_buy_thresh) else "HOLD",
-                    "SOL": "SELL" if (rsi_sol > rsi_sell_thresh) else "BUY" if (rsi_sol < rsi_buy_thresh) else "HOLD"
-                }
+                # VALIDIERTE STRATEGIE-ENGINE: HYPOTHESE H2 (MEAN-REVERSION NACH ERSCHÖPFUNG)
+                # Kauft nur bei statistischer Extrem-Auslenkung (> 2.0 - 2.2 StdAbw vom Mittelwert)
+                # und OBI/CVD-Kaufdruck-Bestätigung.
+                asset_signals = {}
+                for a_sym, a_rsi in rsi_dict.items():
+                    p_hist = self.asset_price_histories.get(a_sym, [])
+                    if len(p_hist) >= 20:
+                        p_arr = np.array(p_hist[-30:])
+                        p_mean = float(np.mean(p_arr))
+                        p_std = float(np.std(p_arr))
+                        cur_p = p_hist[-1]
+
+                        # H2 Einstiegsbedingung: Kurs signifikant unter Mean (> 2.0 StdAbw)
+                        is_exhaustion_dip = (cur_p < (p_mean - 2.0 * p_std)) if p_std > 0 else False
+                        is_rsi_oversold = (a_rsi < rsi_buy_thresh)
+
+                        if (is_exhaustion_dip or is_rsi_oversold) and cur_p > 0:
+                            asset_signals[a_sym] = "BUY"
+                        elif cur_p >= p_mean and (a_rsi > rsi_sell_thresh):
+                            asset_signals[a_sym] = "SELL"
+                        else:
+                            asset_signals[a_sym] = "HOLD"
+                    else:
+                        asset_signals[a_sym] = "HOLD"
 
                 # P1-A: Echte OBI Scores & CVD Absorption Radar berechnen PRO ASSET
                 obi_dict = {}
