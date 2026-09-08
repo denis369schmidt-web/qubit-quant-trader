@@ -1,0 +1,48 @@
+﻿# ==============================================================================
+# 🔐 CRITICAL SECURITY: NEVER COMMIT API KEYS OR CREDENTIALS
+# ==============================================================================
+.kraken_hsm_vault.json
+*.vault.json
+.env
+*.env
+
+# Python Environments & Bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.class
+
+# Databases & Trade History (Contains personal Kraken trade execution logs)
+*.db
+trading_ledger.db
+test_*.db
+
+# Portable Distribution & Local Builds
+qubit_trader_portable/
+qubit_trader_portable.zip
+
+# Temporary Scrape/Fetch Test Dumps
+fetched_data/
+fetched_downloads/
+hidden_content_extractions/
+real_url_extractions/
+secure_extractions/
+smart_downloads/
+live_quantum_trading_feed.json
+quantum_telemetry_stream.json
+realtime_quantum_trading_log.json
+
+# Generated Reports & Local Logs
+*.html
+*.log
+scratch/
+screen_capture.png
+screen_text.txt
+*.bak
+
+# OS Metadata
+.DS_Store
+Thumbs.db
+desktop.ini

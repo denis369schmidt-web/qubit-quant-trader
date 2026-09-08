@@ -1,0 +1,2 @@
+# --- Refactored von IDE Agent: baue noch skills ein in diesen screenreader sodas er mir jeden code schreiben kann den ich will. ---
+[Bild unter C:\Users\schmidtdenis\Desktop\projekte\qubit\screen_capture.png gespeichert.]

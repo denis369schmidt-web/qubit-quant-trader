@@ -1,0 +1,7 @@
+﻿{
+  "hsm_key": "YOUR_KRAKEN_API_KEY",
+  "hsm_secret": "YOUR_KRAKEN_API_SECRET",
+  "hsm_tg_token": "",
+  "hsm_tg_chat": "",
+  "hsm_discord_url": ""
+}

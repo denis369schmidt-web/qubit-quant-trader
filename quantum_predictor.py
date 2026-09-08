@@ -1,0 +1,2 @@
+# --- Refactored von Ultimate Quantum Agent: Passe dieses system extra für slots games aus. ich möchte meine eigenen spiele damit analy<sieren und verstehen ---
+[Bild unter C:\Users\schmidtdenis\Desktop\projekte\qubit\screen_capture.png gespeichert.]
