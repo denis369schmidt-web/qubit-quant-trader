@@ -243,6 +243,7 @@ class MultiExchangeTraderApp:
         self.last_order_time_per_pair: Dict[str, float] = {}
         self.last_logged_status: Dict[str, str] = {}
         self.live_entry_prices: Dict[str, float] = {}
+        self.live_peak_prices: Dict[str, float] = {}
         self.bot_txids: set = set()  # Eigene vom Bot platzierte Order-IDs für sicheren Stale Cleaner
         # Historische Einstiegspreise: Volumengewichteter Durchschnitt (VWAP) aller offenen Lots
         for pair_k, limits_v in KrakenLiveGateway.PAIR_LIMITS.items():
