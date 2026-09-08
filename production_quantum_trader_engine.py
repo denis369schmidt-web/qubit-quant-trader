@@ -62,85 +62,106 @@ HSM_VAULT_PATH = os.path.join(os.getcwd(), ".kraken_hsm_vault.json")
 
 class EncryptedCredentialVault:
     """
-    Fernet-AES128-CBC + HMAC-SHA256 vault.
-    Key is derived from the Windows Machine GUID via PBKDF2-HMAC-SHA256.
-    The raw key never touches disk.  Old base64-obfuscated vaults are
-    detected and transparently migrated on first load.
+    OS-Nativer Windows DPAPI Credential Vault (Version 3).
+    Nutzt CryptProtectData / CryptUnprotectData aus crypt32.dll.
+    Keine eigene Krypto-Implementierung. Die Schlüssel sind hardware- und
+    benutzergebunden durch das Windows-Betriebssystem geschützt.
+    Migriert alte v1 (Base64) und v2 (Fernet) Vaults transparent auf DPAPI.
     """
 
-    _VAULT_FORMAT_VERSION = 2
-    _PBKDF2_ITERATIONS = 260_000
-    _SALT = b"qubit_vault_v2_salt_2026"   # public, fixed per-app salt
+    _VAULT_FORMAT_VERSION = 3
+    _DPAPI_ENTROPY = b"qubit_quant_trader_dpapi_entropy_2026"
 
     # ------------------------------------------------------------------
-    # Key derivation
+    # Windows DPAPI über ctypes
     # ------------------------------------------------------------------
     @staticmethod
-    def _machine_secret() -> bytes:
-        """Derive a stable machine-specific secret from the Windows Machine GUID."""
+    def _dpapi_encrypt(text: str) -> str:
+        if not text:
+            return ""
         try:
-            import winreg
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Cryptography"
-            ) as k:
-                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
-                return guid.encode()
+            import ctypes
+            from ctypes import wintypes
+
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_byte))]
+
+            data_bytes = text.encode('utf-8')
+            entropy_bytes = EncryptedCredentialVault._DPAPI_ENTROPY
+
+            blob_in = DATA_BLOB(len(data_bytes), ctypes.cast(ctypes.create_string_buffer(data_bytes), ctypes.POINTER(ctypes.c_byte)))
+            blob_entropy = DATA_BLOB(len(entropy_bytes), ctypes.cast(ctypes.create_string_buffer(entropy_bytes), ctypes.POINTER(ctypes.c_byte)))
+            blob_out = DATA_BLOB()
+
+            # 0x01 = CRYPTPROTECT_UI_FORBIDDEN
+            if not ctypes.windll.crypt32.CryptProtectData(
+                ctypes.byref(blob_in), "qubit_credential", ctypes.byref(blob_entropy), None, None, 0x01, ctypes.byref(blob_out)
+            ):
+                raise ctypes.WinError()
+
+            cipher_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            return base64.b64encode(cipher_bytes).decode('ascii')
         except Exception:
-            # Fallback: hostname + username (still machine-specific, less unique)
-            import socket
-            return (socket.gethostname() + os.environ.get("USERNAME", "user")).encode()
+            return ""
 
     @staticmethod
-    def _derive_fernet_key() -> bytes:
-        """Return a URL-safe base64-encoded 32-byte Fernet key."""
-        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-        from cryptography.hazmat.primitives import hashes as _hashes
-        from cryptography.hazmat.backends import default_backend
-        kdf = PBKDF2HMAC(
-            algorithm=_hashes.SHA256(),
-            length=32,
-            salt=EncryptedCredentialVault._SALT,
-            iterations=EncryptedCredentialVault._PBKDF2_ITERATIONS,
-            backend=default_backend()
-        )
-        raw = kdf.derive(EncryptedCredentialVault._machine_secret())
-        return base64.urlsafe_b64encode(raw)
-
-    # ------------------------------------------------------------------
-    # Encryption helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _encrypt(text: str) -> str:
-        from cryptography.fernet import Fernet
-        f = Fernet(EncryptedCredentialVault._derive_fernet_key())
-        return f.encrypt(text.encode()).decode()
-
-    @staticmethod
-    def _decrypt(token: str) -> str:
-        from cryptography.fernet import Fernet, InvalidToken
+    def _dpapi_decrypt(b64_cipher: str) -> str:
+        if not b64_cipher:
+            return ""
         try:
-            f = Fernet(EncryptedCredentialVault._derive_fernet_key())
-            return f.decrypt(token.encode()).decode()
-        except (InvalidToken, Exception):
+            import ctypes
+            from ctypes import wintypes
+
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_byte))]
+
+            cipher_bytes = base64.b64decode(b64_cipher.encode('ascii'))
+            entropy_bytes = EncryptedCredentialVault._DPAPI_ENTROPY
+
+            blob_in = DATA_BLOB(len(cipher_bytes), ctypes.cast(ctypes.create_string_buffer(cipher_bytes), ctypes.POINTER(ctypes.c_byte)))
+            blob_entropy = DATA_BLOB(len(entropy_bytes), ctypes.cast(ctypes.create_string_buffer(entropy_bytes), ctypes.POINTER(ctypes.c_byte)))
+            blob_out = DATA_BLOB()
+
+            if not ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(blob_in), None, ctypes.byref(blob_entropy), None, None, 0x01, ctypes.byref(blob_out)
+            ):
+                raise ctypes.WinError()
+
+            plain_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            return plain_bytes.decode('utf-8')
+        except Exception:
             return ""
 
     # ------------------------------------------------------------------
-    # Legacy (v1) detection & migration
+    # Legacy Fallback / Migration (v1 & v2)
     # ------------------------------------------------------------------
     @staticmethod
-    def _is_legacy(value: str) -> bool:
-        """Return True if this looks like old base64(sha256+plaintext) encoding."""
+    def _decrypt_v2_fernet(token: str) -> str:
         try:
-            raw = base64.b64decode(value.encode())
-            # Legacy tokens are exactly 32 (sha256) + len(plaintext) bytes,
-            # and are NOT valid Fernet tokens (which start with version byte 0x80).
-            return len(raw) >= 32 and raw[0] != 0x80
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            from cryptography.hazmat.primitives import hashes as _hashes
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.fernet import Fernet
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
+                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
+                sec = guid.encode()
+            
+            kdf = PBKDF2HMAC(
+                algorithm=_hashes.SHA256(), length=32, salt=b"qubit_vault_v2_salt_2026",
+                iterations=260_000, backend=default_backend()
+            )
+            raw = kdf.derive(sec)
+            f_key = base64.urlsafe_b64encode(raw)
+            return Fernet(f_key).decrypt(token.encode()).decode()
         except Exception:
-            return False
+            return ""
 
     @staticmethod
-    def _deobfuscate_legacy(encoded_str: str) -> str:
+    def _deobfuscate_v1(encoded_str: str) -> str:
         try:
             raw = base64.b64decode(encoded_str.encode())
             return raw[32:].decode()
@@ -155,11 +176,11 @@ class EncryptedCredentialVault:
         try:
             vault_data = {
                 "vault_format": EncryptedCredentialVault._VAULT_FORMAT_VERSION,
-                "hsm_key":         EncryptedCredentialVault._encrypt(api_key),
-                "hsm_secret":      EncryptedCredentialVault._encrypt(api_secret),
-                "hsm_tg_token":    EncryptedCredentialVault._encrypt(tg_token),
-                "hsm_tg_chat":     EncryptedCredentialVault._encrypt(tg_chat),
-                "hsm_discord_url": EncryptedCredentialVault._encrypt(discord_url),
+                "hsm_key":         EncryptedCredentialVault._dpapi_encrypt(api_key),
+                "hsm_secret":      EncryptedCredentialVault._dpapi_encrypt(api_secret),
+                "hsm_tg_token":    EncryptedCredentialVault._dpapi_encrypt(tg_token),
+                "hsm_tg_chat":     EncryptedCredentialVault._dpapi_encrypt(tg_chat),
+                "hsm_discord_url": EncryptedCredentialVault._dpapi_encrypt(discord_url),
                 "vault_timestamp": time.time()
             }
             with open(HSM_VAULT_PATH, "w", encoding="utf-8") as f:
@@ -176,14 +197,20 @@ class EncryptedCredentialVault:
             with open(HSM_VAULT_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            fmt = data.get("vault_format", 1)
+
             def _read(field: str) -> str:
                 val = data.get(field, "")
                 if not val:
                     return ""
-                # Transparent migration: v1 → v2
-                if EncryptedCredentialVault._is_legacy(val):
-                    return EncryptedCredentialVault._deobfuscate_legacy(val)
-                return EncryptedCredentialVault._decrypt(val)
+                if fmt == 3:
+                    return EncryptedCredentialVault._dpapi_decrypt(val)
+                elif fmt == 2:
+                    res = EncryptedCredentialVault._decrypt_v2_fernet(val)
+                    return res if res else EncryptedCredentialVault._dpapi_decrypt(val)
+                else: # v1
+                    res = EncryptedCredentialVault._deobfuscate_v1(val)
+                    return res if res else EncryptedCredentialVault._dpapi_decrypt(val)
 
             result = (
                 _read("hsm_key"),
@@ -193,8 +220,8 @@ class EncryptedCredentialVault:
                 _read("hsm_discord_url"),
             )
 
-            # Auto-migrate v1 vault to v2 on first successful load
-            if data.get("vault_format", 1) < EncryptedCredentialVault._VAULT_FORMAT_VERSION:
+            # Auto-Migration auf v3 (DPAPI)
+            if fmt < EncryptedCredentialVault._VAULT_FORMAT_VERSION:
                 EncryptedCredentialVault.save_vault(*result)
 
             return result
@@ -289,7 +316,7 @@ class MultiExchangeTraderApp:
             title_frame, text="⚡ QUBIT QUANT TRADER", bg="#111827", fg="#00ff88", font=("Segoe UI", 13, "bold")
         ).pack(anchor="w")
         tk.Label(
-            title_frame, text="Institutional HFT Engine • Sub-15ms WebSocket Gateway", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8)
+            title_frame, text="Event-Driven Real-Time Spot Engine • Multi-Regime & Risk-Gated Architecture", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8)
         ).pack(anchor="w")
 
         # Control Buttons
@@ -566,6 +593,17 @@ class MultiExchangeTraderApp:
             if not self.kraken_api_key or not self.kraken_api_secret:
                 messagebox.showwarning("API Keys Fehlen", "Bitte hinterlege erst deine Kraken API Keys im Vault.")
                 return
+            confirm = messagebox.askyesno(
+                "🚨 ECHTGELD-HANDEL FREIGEBEN?",
+                "ACHTUNG: Du bist dabei, den vollautonomen LIVE-Modus mit echtem Kraken-Guthaben zu aktivieren!\n\n"
+                "• Es werden echte Marktorders an Kraken übermittelt.\n"
+                "• Echte Gebühren und Marktrisiken fallen an.\n\n"
+                "Möchtest du den Live-Modus wirklich starten?",
+                icon="warning"
+            )
+            if not confirm:
+                self.log_console("🛡️ LIVE-Aktivierung vom Nutzer abgebrochen. Bleibe im sicheren PAPER-Modus.")
+                return
             self.trading_mode = "LIVE"
             self.btn_mode_toggle.config(text="🔴 MODUS: LIVE KRAKEN", bg="#f43f5e")
             self.log_console("⚠️ UMGESCHALTET AUF LIVE KRAKEN HANDEL (ECHTGELD)!")
@@ -645,7 +683,7 @@ class MultiExchangeTraderApp:
         dialog.attributes("-topmost", True)
 
         tk.Label(dialog, text="🔐 Kraken API & Webhook Vault", bg="#111827", fg="#00ff88", font=("Segoe UI", 12, "bold")).pack(pady=(12, 4))
-        tk.Label(dialog, text="Schlüssel werden mit Fernet (AES-128-CBC + HMAC-SHA256) verschlüsselt, Schlüssel aus Machine-GUID abgeleitet", bg="#111827", fg="#64748b", font=("Segoe UI", 8)).pack(pady=(0, 8))
+        tk.Label(dialog, text="Schlüssel werden nativ über Windows DPAPI (CryptProtectData) hardware- und benutzergebunden geschützt", bg="#111827", fg="#64748b", font=("Segoe UI", 8)).pack(pady=(0, 8))
 
         # Kraken API
         tk.Label(dialog, text="Kraken API Key:", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=30, pady=(4, 1))
