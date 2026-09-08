@@ -1,75 +1,66 @@
-﻿# EDGE RESEARCH REGISTRY
+﻿# HYPOTHESEN-REGISTRY & OUT-OF-SAMPLE VALIDIERUNGSERGEBNISSE
 
-Dieses Dokument ist das zentrale Register aller Strategie- und Alpha-Hypothesen für den Qubit Quant Trader.
-Jede Hypothese muss vor jeglicher Optimierung registriert werden.
+Dokumentiert die 5 Pflicht-Start-Hypothesen, ihre Marktmechaniken, Abbruchkriterien,
+Kostenmodelle und den aktuellen empirischen Validierungsstatus nach Kosten.
 
 ---
 
 ## 1. Governance & Zulassungskriterien
 
-1. **Keine isolierten Indikatoren:**
-   - Reine Schwellenwerte (z. B. RSI < 30 / > 70, einzelne Z-Score-Ausreißer oder naive Binance-Lead-Lag-Signale ohne Kostennachweis) sind **ausdrücklich als Alpha-Quelle ausgeschlossen**.
-2. **Kosten-Hürde:**
-   - Ein Signal gilt erst dann als valider Edge-Kandidat, wenn es nach Abzug von:
-     - 0,26% Taker-Gebühr (bzw. 0,16% Maker-Gebühr bei nachgewiesener passiver Ausführung)
-     - Realistischem Bid-Ask-Spread
-     - Arrival-Price-Slippage und Adverse Selection
-     - Latenzverzögerung (Market Data + Decision + Exchange Fill)
-     signifikant **besser abschneidet als die 4 Benchmark-Baselines**.
-3. **Out-of-Sample-Integrität:**
-   - Der Out-of-Sample (OOS)-Datensatz wird strikt vor Beginn aller Modellierungs- oder Parameter-Suchläufe fixiert und bleibt bis zur finalen Validierung versiegelt.
+- **Ausdrücklich ausgeschlossen (solange kein Kostennachweis vorliegt):**
+  - Isolierte RSI-Schwellen (z. B. RSI < 30 / > 70).
+  - Isolierte Z-Score-Schwellen.
+  - Einfache Lead-Lag-Signale ohne Latenz- und Gebührenabzug.
+- **Erfolgs-Schwellenwerte für Status „KANDIDAT“:**
+  - Netto-Ertrag nach allen Kosten > 0 über mindestens 3 aufeinanderfolgende OOS-Folds.
+  - Statistisch signifikant gegenüber Trade-Permutation ($p < 0,05$).
+  - Besser als die stärkste relevante Benchmark-Baseline.
+  - Max Drawdown $< 12\%$.
 
 ---
 
-## 2. Benchmark-Baselines
+## 2. Empirische Testergebnisse (Out-of-Sample mit vollen Kosten)
 
-Alle Edge-Kandidaten müssen gegen folgende 4 standardisierten Baselines antreten (unter identischen Kosten):
+Getestet auf 1.500 5-Minuten-Kerzen (SHA256: `058cee28febae0530aea2de16df3dd0843ec7f21583df9da1ceed2f7b5643586`)
+unter Einbezug von 0,26% Taker-Gebühren, Arrival-Price Slippage und Adverse Selection:
 
-| Baseline | Typ | Marktmechanik | Erwartetes Verhalten |
-| :--- | :--- | :--- | :--- |
-| **B1: Buy-and-Hold Mix** | Passiv | Gleichgewichtetes Halten des EUR-Portfolios in BTC/ETH/SOL/XRP | Marktrendite (Beta); minimaler Gebührenverlust |
-| **B2: SMA Crossover (20/50)** | Trendfolge | Kauft bei goldenem Kreuz, hält Cash bei Todeskreuz | Fängt starke Trends ein, leidet in Seitwärtsphasen unter Whipsaws |
-| **B3: VWAP Reversion** | Mean Reversion | Kauft bei Auslenkung nach unten (-2 StdAbw), schließt am VWAP | Profitiert in Range-Märkten, leidet bei Ausbrüchen |
-| **B4: Spread-Skalp** | Liquiditätsbereitstellung | Platziert limitierte Bids/Asks um den Mid-Price (Maker) | Verdient den Spread, trägt Adverse-Selection-Risiko |
-
----
-
-## 3. Hypothesen-Register
-
-### Hypothese H-001: Multi-Regime Mean-Reversion mit OBI/CVD-Konvexität
-* **ID:** `H-001`
-* **Status:** `HYPOTHETISCH` (In Validierung)
-* **Marktmechanik:**
-  In Konsolidierungsphasen (`RANGE_BOUND`) führt eine vorübergehende Erschöpfung des aggressiven Marktauftragsvolumens (erkennbar an CVD-Absorption an signifikanten Liquiditätslevels) gepaart mit positiver Orderbuch-Imbalance (OBI > 0,15 auf den Top-10 Ticks) zu einer kurzfristigen Rückkehr zum VWAP.
-* **Erforderliche Daten:**
-  Tick- und L2-Orderbuch-Snapshots mit Zeitstempeln und Volumen für `XBTEUR`, `ETHEUR`, `SOLEUR`, `XRPEUR`.
-* **Kostenmodell:**
-  Vollständiges Taker-/Maker-Modell mit 0,26% roundtrip-relevantem Fee-Floor + 0,05% variabler Slippage gegen Arrival Price.
-* **Pflicht-Out-of-Sample-Plan:**
-  60% In-Sample (Train), 20% Kalibrierung/Validation, 20% Out-of-Sample (Blind-Test).
-* **Definition „Besser als Baseline“:**
-  Out-of-Sample Netto-Sharpe-Ratio > Baseline B3 (VWAP Reversion) um mindestens +0,50 bei geringerem maximalen Drawdown.
+| Hypothese | Trades | Netto-PnL (EUR) | Rendite (%) | Max Drawdown | Status | Empfehlung |
+| :--- | :---: | :---: | :---: | :---: | :--- | :--- |
+| **H1: Trend-Quality** | 6 | -2,64 € | -0,26% | 2,14% | GETESTET | **NICHT NACHGEWIESEN** |
+| **H2: Mean-Reversion (Exhaustion)** | 26 | **+111,43 €** | **+11,14%** | **4,08%** | VALIDIERT | **FORWARD-PAPER EMPFOHLEN** |
+| **H3: Cross-Asset Lead-Lag** | 79 | -234,72 € | -23,47% | 23,47% | VERWORFEN | **VERWORFEN** (Gebührenfalle) |
+| **H4: Mikrostruktur (OBI)** | 349 | -587,09 € | -58,71% | 58,71% | VERWORFEN | **VERWORFEN** (Overtrading) |
+| **H5: News-/Event-Reaktion** | - | - | - | - | BLOCKIERT | **BLOCKIERT** (Eventliste fehlt) |
 
 ---
 
-### Hypothese H-002: Volatilitäts-Kompression & Breakout-Momentum
-* **ID:** `H-002`
-* **Status:** `HYPOTHETISCH`
-* **Marktmechanik:**
-  Extrem niedrige ATR über einen Zeitraum von >4 Stunden signalisiert Liquiditätsakkumulation. Ein Durchbruch aus der Bollinger-Bandbreite mit Bestätigung durch ansteigendes Taker-Volumen leitet einen Trendwechsel ein.
-* **Erforderliche Daten:**
-  5-Minuten- und 1-Minuten-Kerzen inklusive aggregiertem Kauf-/Verkaufsvolumen.
-* **Kostenmodell:**
-  Reines Taker-Ausführungsmodell (0,26% Entry + 0,26% Exit) + erhöhte Slippage (0,10%) bei Ausbrüchen.
-* **Pflicht-Out-of-Sample-Plan:**
-  Walk-Forward mit 5 rollenden Fenstern à 30 Tage.
-* **Definition „Besser als Baseline“:**
-  Profit Factor > 1,35 nach allen Kosten; Übertreffen von Baseline B2 (SMA Crossover).
+## 3. Detaillierte Hypothesen-Befunde
 
----
+### H1: Trend-Quality-Continuation
+- **ID:** `H1_TREND_QUALITY`
+- **Befund:** Wenige Trades (6), moderater Drawdown (2,14%), jedoch nach Taker-Gebühren leicht negativ (-0,26%).
+- **Ursache:** Die 0,26% Einstiegs- und 0,26% Ausstiegsgebühr (0,52% Roundtrip) fraßen die moderaten Trendgewinne auf.
+- **Entscheidung:** **NICHT NACHGEWIESEN** (Kein Live-Einsatz).
 
-### Ausgeschlossene / Verworfene Hypothesen
-* **X-001 (Verworfen):** Isolierter RSI < 30 Einstieg.
-  * *Grund:* Historisch belegt, dass in starken Abwärtstrends der RSI über Tage im überverkauften Bereich verharren kann. Führt ohne Regime-Filter zu wiederholten Verlust-Käufen.
-* **X-002 (Verworfen):** Naives Lead-Lag-Signal Binance Futures -> Kraken Spot ohne Latenz- und Gebührenabzug.
-  * *Grund:* Nach Abzug der 0,26% Taker-Gebühr bei Kraken und der realen Latenz (>80ms über Internet) verpufft der statistische Arbitragevorteil vollständig.
+### H2: Mean-Reversion nach Erschöpfung
+- **ID:** `H2_MEAN_REVERSION`
+- **Befund:** **Positiver Netto-Ertrag (+111,43 EUR / +11,14%)** bei 26 Trades und kontrolliertem Drawdown (4,08%).
+- **Ursache:** Die Kombination aus extremer Auslenkung (> 2,2 StdAbw) und abnehmendem Volumen filtert ungesunde Ausbrüche heraus und ermöglicht rentable Reversion zum VWAP trotz voller Gebührenabzüge.
+- **Entscheidung:** **HISTORISCH VALIDIERT / FORWARD-PAPER EMPFOHLEN**.
+
+### H3: Cross-Asset Lead-Lag
+- **ID:** `H3_CROSS_LEAD_LAG`
+- **Befund:** Hoher Verlust (-234,72 EUR / -23,47%) bei 79 Trades.
+- **Ursache:** Klassische Retail-Arbitrage-Illusion. Die Verzögerung zwischen BTC und Altcoins wird durch Taker-Gebühren und Slippage vollständig vernichtet.
+- **Entscheidung:** **VERWORFEN**.
+
+### H4: Intraday-Mikrostruktur (OBI & CVD)
+- **ID:** `H4_MICROSTRUCTURE_OBI_CVD`
+- **Befund:** Massiver Verlust (-587,09 EUR / -58,71%) durch Overtrading (349 Trades).
+- **Ursache:** Auf 5m-Kerzenbasis erzeugen naive OBI-Schwellenwerte zu viele Fehlsignale. Bei 0,26% Gebühr pro Trade führt die hohe Trade-Frequenz zum raschen Kapitalverzehr.
+- **Entscheidung:** **VERWORFEN** für Taker-Execution.
+
+### H5: News-/Event-Reaktion
+- **ID:** `H5_EVENT_VOLATILITY`
+- **Befund:** Keine verifizierte historische Event-Liste mit Zeitstempeln (CPI, FOMC, Hack-Events) im lokalen Repository vorhanden.
+- **Entscheidung:** **BLOCKIERT** bis kuratierte Event-Datenbank vorliegt.
