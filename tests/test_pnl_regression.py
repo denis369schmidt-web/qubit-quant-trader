@@ -251,11 +251,58 @@ class TestPnLRegression(unittest.TestCase):
         self.assertAlmostEqual(float(pnl), -0.12104, places=5,
                                msg=f"DB-Round-Trip PnL falsch: erwartet -0.12104, erhalten {pnl}")
 
+    def test_weighted_average_cost_basis(self):
+        """Verifiziert die exakte VWAP-Berechnung über mehrere Zukäufe."""
+        # Lot 1: 1.0 @ 100 EUR
+        self.ledger.record_buy_trade(
+            timestamp="10:00:00", pair="XBTEUR", price=100.0, volume=1.0, fee_eur=0.26, txid="L1", status="EX"
+        )
+        # Lot 2: 2.0 @ 130 EUR
+        self.ledger.record_buy_trade(
+            timestamp="10:05:00", pair="XBTEUR", price=130.0, volume=2.0, fee_eur=0.676, txid="L2", status="EX"
+        )
+        # Erwarteter VWAP: (1*100 + 2*130) / 3 = 360 / 3 = 120.0 EUR
+        vwap = self.ledger.fetch_weighted_average_cost_basis("XBTEUR")
+        self.assertIsNotNone(vwap)
+        self.assertAlmostEqual(vwap, 120.0, places=4)
+
+    def test_cancel_stale_orders_bot_id_filtering(self):
+        """Verifiziert, dass cancel_stale_orders fremde Orders ignoriert."""
+        from institutional_trading_core import KrakenLiveGateway
+        # Simuliere query_private Mock
+        original_query = KrakenLiveGateway.query_private
+        try:
+            now = 1000.0
+            fake_orders = {
+                "BOT-ORDER-1": {"opentm": 900.0},     # 100s alt (stale)
+                "MANUAL-ORDER-2": {"opentm": 900.0},  # 100s alt (stale aber manuell)
+            }
+            cancelled = []
+
+            def mock_query(endpoint, data, k, s):
+                if endpoint == "/0/private/OpenOrders":
+                    return {"result": {"open": fake_orders}}
+                elif endpoint == "/0/private/CancelOrder":
+                    cancelled.append(data.get("txid"))
+                    return {"result": {"count": 1}}
+                return {}
+
+            KrakenLiveGateway.query_private = mock_query
+            bot_allowed = {"BOT-ORDER-1"}
+
+            res = KrakenLiveGateway.cancel_stale_orders("k", "s", allowed_txids=bot_allowed)
+            self.assertEqual(res["status"], "success")
+            self.assertIn("BOT-ORDER-1", cancelled)
+            self.assertNotIn("MANUAL-ORDER-2", cancelled)
+            self.assertEqual(len(cancelled), 1)
+        finally:
+            KrakenLiveGateway.query_private = original_query
+
     def test_unknown_cost_basis_returns_none_not_zero(self):
         """P0-Sicherheitstest: record_sell_trade muss None (nicht 0.0) zurückgeben
         wenn kein offenes Lot existiert (UNKNOWN_COST_BASIS-Szenario).
         """
-        # KEIN record_buy_trade vorher → kein Lot in der Datenbank
+        # KEIN record_buy_trade vorher -> kein Lot in der Datenbank
         succ, pnl = self.ledger.record_sell_trade(
             timestamp="10:00:00",
             pair="SOLEUR",
@@ -269,6 +316,33 @@ class TestPnLRegression(unittest.TestCase):
         self.assertIsNone(pnl,
                           "UNKNOWN_COST_BASIS muss None zurückgeben, nicht 0.0 – "
                           "sonst wird ein fiktiver Gewinn im kumulativen PnL verbucht")
+
+    def test_verify_order_fill_logic(self):
+        """Testet die echte Fill-Verifikation via Kraken API Mock."""
+        from institutional_trading_core import KrakenLiveGateway
+        original_query = KrakenLiveGateway.query_private
+        try:
+            fake_response = {
+                "result": {
+                    "TX-12345": {
+                        "status": "closed",
+                        "vol_exec": "0.05",
+                        "cost": "3650.0",
+                        "fee": "9.49",
+                        "price": "73000.0"
+                    }
+                }
+            }
+            KrakenLiveGateway.query_private = lambda endpoint, data, k, s: fake_response
+
+            res = KrakenLiveGateway.verify_order_fill("key", "secret", "TX-12345", max_wait_sec=0.5)
+            self.assertEqual(res.get("status"), "filled")
+            self.assertEqual(res.get("kraken_status"), "closed")
+            self.assertAlmostEqual(res.get("filled_volume"), 0.05)
+            self.assertAlmostEqual(res.get("price"), 73000.0)
+            self.assertAlmostEqual(res.get("fee_eur"), 9.49)
+        finally:
+            KrakenLiveGateway.query_private = original_query
 
 if __name__ == "__main__":
     unittest.main()

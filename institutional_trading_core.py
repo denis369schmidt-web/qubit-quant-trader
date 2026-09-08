@@ -492,6 +492,25 @@ class SQLiteTradeLedgerManager:
             except Exception:
                 return None
 
+    def fetch_weighted_average_cost_basis(self, pair: str) -> Optional[float]:
+        """Berechnet den volumengewichteten durchschnittlichen Einstiegspreis (VWAP) aller offenen Lots."""
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT entry_price, volume_remaining FROM open_lots WHERE pair = ? AND volume_remaining > 1e-12", (pair,))
+                rows = cursor.fetchall()
+                conn.close()
+                if not rows:
+                    return None
+                total_vol = sum(float(r[1]) for r in rows)
+                if total_vol <= 1e-12:
+                    return None
+                total_cost = sum(float(r[0]) * float(r[1]) for r in rows)
+                return total_cost / total_vol
+            except Exception:
+                return None
+
 
 class KrakenLiveGateway:
     """Echte Kraken API-Schnittstelle mit Stale Order Management & thread-sicherer Nonce-Synchronisation"""
@@ -623,8 +642,53 @@ class KrakenLiveGateway:
             return "XBTEUR", "BTC", eur
 
     @classmethod
-    def cancel_stale_orders(cls, api_key: str, api_secret: str) -> Dict[str, Any]:
-        """Storniert offene Orders, die nicht gefüllt wurden (Stale Order Cleaner)"""
+    def query_order_status(cls, api_key: str, api_secret: str, txid: str) -> Dict[str, Any]:
+        """Fragt den Status einer Order via /0/private/QueryOrders ab (Echter Fill-Check)."""
+        if not api_key or not api_secret or not txid:
+            return {"status": "error", "message": "Parameter fehlen"}
+        res = cls.query_private("/0/private/QueryOrders", {"txid": txid, "trades": True}, api_key, api_secret)
+        if res.get("error") or res.get("status") == "error":
+            return {"status": "error", "message": str(res.get("error") or res.get("message"))}
+        orders = res.get("result", {})
+        if txid in orders:
+            return {"status": "success", "order": orders[txid]}
+        return {"status": "not_found", "message": f"Order {txid} nicht gefunden"}
+
+    @classmethod
+    def verify_order_fill(cls, api_key: str, api_secret: str, txid: str, max_wait_sec: float = 3.0) -> Dict[str, Any]:
+        """
+        P0-D: Prüft ob eine Order tatsächlich ausgeführt (closed/filled) wurde.
+        Gibt reale Ausführungspreise, Volumen und Gebühren von Kraken zurück.
+        """
+        start_t = time.time()
+        while time.time() - start_t < max_wait_sec:
+            res = cls.query_order_status(api_key, api_secret, txid)
+            if res.get("status") == "success":
+                ord_info = res.get("order", {})
+                status = ord_info.get("status", "").lower()
+                if status == "closed":
+                    # Order vollständig ausgeführt
+                    vol_exec = float(ord_info.get("vol_exec", 0.0))
+                    cost = float(ord_info.get("cost", 0.0))
+                    fee = float(ord_info.get("fee", 0.0))
+                    price = float(ord_info.get("price", cost / vol_exec if vol_exec > 0 else 0.0))
+                    return {
+                        "status": "filled",
+                        "txid": txid,
+                        "filled_volume": vol_exec,
+                        "price": price,
+                        "fee_eur": fee,
+                        "cost_eur": cost,
+                        "kraken_status": "closed"
+                    }
+                elif status in ["canceled", "expired"]:
+                    return {"status": "canceled", "txid": txid, "kraken_status": status}
+            time.sleep(0.5)
+        return {"status": "pending_or_unconfirmed", "txid": txid}
+
+    @classmethod
+    def cancel_stale_orders(cls, api_key: str, api_secret: str, allowed_txids: Optional[set] = None) -> Dict[str, Any]:
+        """Storniert offene Orders nach 30s. Wenn allowed_txids gesetzt ist, NUR eigene Bot-Orders!"""
         if not api_key or not api_secret:
             return {"status": "error"}
 
@@ -636,6 +700,9 @@ class KrakenLiveGateway:
         canceled_count = 0
         now = time.time()
         for txid, order_info in open_orders.items():
+            if allowed_txids is not None and txid not in allowed_txids:
+                # Nicht vom Bot platziert -> Nicht anfassen!
+                continue
             opentm = float(order_info.get("opentm", now))
             if now - opentm > 30.0:  # Älter als 30 Sekunden
                 cancel_res = cls.query_private("/0/private/CancelOrder", {"txid": txid}, api_key, api_secret)

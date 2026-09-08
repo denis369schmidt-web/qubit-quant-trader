@@ -53,6 +53,13 @@ class MultiExchangeWebSocketManager:
             "Coinbase": {"obi": 0.0, "bids": [], "asks": []},
             "Bybit": {"obi": 0.0, "bids": [], "asks": []}
         }
+        # P1-A: Eigenständige Orderbücher pro gehandeltem Asset
+        self.asset_orderbooks: Dict[str, Dict[str, Any]] = {
+            "BTC": {"obi": 0.0, "bids": [], "asks": []},
+            "XRP": {"obi": 0.0, "bids": [], "asks": []},
+            "ETH": {"obi": 0.0, "bids": [], "asks": []},
+            "SOL": {"obi": 0.0, "bids": [], "asks": []}
+        }
         self.running = True
         self.threads: List[threading.Thread] = []
         self.binance_price_history: List[Tuple[float, float]] = []
@@ -94,7 +101,14 @@ class MultiExchangeWebSocketManager:
             t.start()
 
     def _run_multi_asset_ticker_loop(self):
-        """Holt kontinuierlich echte Live-Preise für BTC, XRP, ETH und SOL in EUR"""
+        """Holt kontinuierlich echte Live-Preise für BTC, XRP, ETH und SOL in EUR sowie separate Orderbücher"""
+        pair_mapping = {
+            "XBTEUR": "BTC",
+            "XRPEUR": "XRP",
+            "ETHEUR": "ETH",
+            "SOLEUR": "SOL"
+        }
+        loop_counter = 0
         while self.running:
             try:
                 url = "https://api.kraken.com/0/public/Ticker?pair=XBTEUR,XRPEUR,ETHEUR,SOLEUR"
@@ -112,9 +126,33 @@ class MultiExchangeWebSocketManager:
                             self.asset_prices["ETH"] = price
                         elif "SOL" in pair_name:
                             self.asset_prices["SOL"] = price
+
+                # P1-A: Eigenständige Orderbücher rotierend oder periodisch abfragen
+                # Jede Runde wird ein Asset-Orderbuch aktualisiert um API-Limits einzuhalten
+                target_pair = list(pair_mapping.keys())[loop_counter % len(pair_mapping)]
+                target_asset = pair_mapping[target_pair]
+                loop_counter += 1
+
+                depth_url = f"https://api.kraken.com/0/public/Depth?pair={target_pair}&count=20"
+                req_depth = urllib.request.Request(depth_url, headers={'User-Agent': 'InstitutionalMultiAssetFeed/2026'})
+                with urllib.request.urlopen(req_depth, timeout=3.0) as resp_d:
+                    res_d = json.loads(resp_d.read().decode('utf-8'))
+                    result_d = res_d.get("result", {})
+                    for p_key, p_val in result_d.items():
+                        bids = p_val.get("bids", [])
+                        asks = p_val.get("asks", [])
+                        bid_vol = sum(float(b[1]) for b in bids[:10]) if bids else 0.0
+                        ask_vol = sum(float(a[1]) for a in asks[:10]) if asks else 0.0
+                        total_v = bid_vol + ask_vol
+                        obi = (bid_vol - ask_vol) / total_v if total_v > 0 else 0.0
+                        self.asset_orderbooks[target_asset] = {
+                            "obi": round(obi, 4),
+                            "bids": bids,
+                            "asks": asks
+                        }
             except Exception:
                 pass
-            time.sleep(2.0)
+            time.sleep(1.5)
 
     def _poll_kraken_rest(self):
         try:

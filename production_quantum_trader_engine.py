@@ -243,13 +243,18 @@ class MultiExchangeTraderApp:
         self.last_order_time_per_pair: Dict[str, float] = {}
         self.last_logged_status: Dict[str, str] = {}
         self.live_entry_prices: Dict[str, float] = {}
-        self.live_peak_prices: Dict[str, float] = {}
-        # Historische Einstiegspreise aus dem persistenten Handelsjournal laden
+        self.bot_txids: set = set()  # Eigene vom Bot platzierte Order-IDs für sicheren Stale Cleaner
+        # Historische Einstiegspreise: Volumengewichteter Durchschnitt (VWAP) aller offenen Lots
         for pair_k, limits_v in KrakenLiveGateway.PAIR_LIMITS.items():
-            last_bp = self.db_manager.fetch_last_buy_price(pair_k)
-            if last_bp and last_bp > 0:
-                self.live_entry_prices[limits_v["asset"]] = last_bp
-                self.live_peak_prices[limits_v["asset"]] = last_bp
+            vwap_p = self.db_manager.fetch_weighted_average_cost_basis(pair_k)
+            if vwap_p and vwap_p > 0:
+                self.live_entry_prices[limits_v["asset"]] = vwap_p
+                self.live_peak_prices[limits_v["asset"]] = vwap_p
+            else:
+                last_bp = self.db_manager.fetch_last_buy_price(pair_k)
+                if last_bp and last_bp > 0:
+                    self.live_entry_prices[limits_v["asset"]] = last_bp
+                    self.live_peak_prices[limits_v["asset"]] = last_bp
         
         # Unabhängige Preis-Historien pro Asset
         self.asset_price_histories: Dict[str, List[float]] = {
@@ -534,9 +539,9 @@ class MultiExchangeTraderApp:
         def loop():
             while self.running:
                 if self.trading_mode == "LIVE" and self.kraken_api_key and self.kraken_api_secret:
-                    res = KrakenLiveGateway.cancel_stale_orders(self.kraken_api_key, self.kraken_api_secret)
+                    res = KrakenLiveGateway.cancel_stale_orders(self.kraken_api_key, self.kraken_api_secret, allowed_txids=self.bot_txids)
                     if res.get("status") == "success" and res.get("canceled_count", 0) > 0:
-                        self.log_console(f"🧹 STALE ORDER CLEANER: {res['canceled_count']} alte ungefüllte Order(s) storniert.")
+                        self.log_console(f"🧹 STALE ORDER CLEANER: {res['canceled_count']} alte eigene Bot-Order(s) storniert.")
                 time.sleep(15.0)
 
         threading.Thread(target=loop, daemon=True).start()
@@ -776,14 +781,24 @@ class MultiExchangeTraderApp:
                     "SOL": "SELL" if (rsi_sol > rsi_sell_thresh) else "BUY" if (rsi_sol < rsi_buy_thresh) else "HOLD"
                 }
 
-                # OBI Scores & CVD Absorption Radar berechnen pro Asset
-                kraken_obi = self.ws_manager.orderbooks.get("Kraken", {}).get("obi", 0.0)
-                kraken_bids = self.ws_manager.orderbooks.get("Kraken", {}).get("bids", [])
-                kraken_asks = self.ws_manager.orderbooks.get("Kraken", {}).get("asks", [])
-                cvd_data = TechnicalAnalysisEngine.calculate_cvd_absorption(kraken_bids, kraken_asks)
+                # P1-A: Echte OBI Scores & CVD Absorption Radar berechnen PRO ASSET
+                obi_dict = {}
+                cvd_dict = {}
+                for a_code in ["BTC", "XRP", "ETH", "SOL"]:
+                    a_ob = getattr(self.ws_manager, "asset_orderbooks", {}).get(a_code, {})
+                    a_bids = a_ob.get("bids", [])
+                    a_asks = a_ob.get("asks", [])
+                    obi_dict[a_code] = a_ob.get("obi", 0.0)
+                    cvd_dict[a_code] = TechnicalAnalysisEngine.calculate_cvd_absorption(a_bids, a_asks)
 
-                obi_dict = {"BTC": kraken_obi, "XRP": kraken_obi, "ETH": kraken_obi, "SOL": kraken_obi}
-                cvd_dict = {"BTC": cvd_data, "XRP": cvd_data, "ETH": cvd_data, "SOL": cvd_data}
+                # Fallback für BTC falls asset_orderbooks noch initialisiert wird
+                if not obi_dict.get("BTC") and "Kraken" in self.ws_manager.orderbooks:
+                    k_bids = self.ws_manager.orderbooks["Kraken"].get("bids", [])
+                    k_asks = self.ws_manager.orderbooks["Kraken"].get("asks", [])
+                    obi_dict["BTC"] = self.ws_manager.orderbooks["Kraken"].get("obi", 0.0)
+                    cvd_dict["BTC"] = TechnicalAnalysisEngine.calculate_cvd_absorption(k_bids, k_asks)
+
+                cvd_data = cvd_dict.get("BTC", {})
 
                 # Binance Lead-Lag Signal abfragen
                 lead_lag = self.ws_manager.get_binance_lead_lag_signal()
@@ -872,6 +887,14 @@ class MultiExchangeTraderApp:
                         if now_tm - self.last_order_time_per_pair.get(pair_name, 0.0) < 30.0:
                             continue
 
+                        # P1-B: Signal-Deduplizierung & Positions-Guard
+                        # Wenn bereits ein aktives Lot/eine Position für dieses Asset existiert, keine wiederholten Zukäufe ausführen!
+                        if order["side"] == "BUY":
+                            existing_lots = self.db_manager.fetch_open_lots(pair_name)
+                            if existing_lots:
+                                # Position existiert bereits -> Kauf blockieren zur Risikovermeidung
+                                continue
+
                         # Multi-Pair Correlation Guard (Verhindert Klumpenrisiken)
                         if order["side"] == "BUY":
                             corr_throttle, corr_msg = MultiPairCorrelationGuard.should_throttle_correlated_buy(
@@ -906,38 +929,60 @@ class MultiExchangeTraderApp:
                             if live_res.get("status") == "success":
                                 self.last_order_time_per_pair[pair_name] = now_tm
                                 txid = live_res['txid']
-                                fee_eur = round(live_res["price"] * live_res["volume"] * 0.0026, 4)
-                                
+                                self.bot_txids.add(txid)  # Registrieren für Stale Cleaner
+
+                                # P0-D: Echte Fill-Verifikation über Kraken API statt blindem Vertrauen in AddOrder
+                                fill_check = KrakenLiveGateway.verify_order_fill(
+                                    self.kraken_api_key,
+                                    self.kraken_api_secret,
+                                    txid=txid,
+                                    max_wait_sec=2.0
+                                )
+
+                                if fill_check.get("status") == "filled":
+                                    actual_price = fill_check.get("price", live_res["price"])
+                                    actual_vol = fill_check.get("filled_volume", live_res["volume"])
+                                    actual_fee = fill_check.get("fee_eur", round(actual_price * actual_vol * 0.0026, 4))
+                                    order_status_label = f"🔴 LIVE FILLED ({txid})"
+                                else:
+                                    # Fallback auf AddOrder-Angaben falls QueryOrders verzögert
+                                    actual_price = live_res["price"]
+                                    actual_vol = live_res["volume"]
+                                    actual_fee = round(actual_price * actual_vol * 0.0026, 4)
+                                    order_status_label = f"🔴 LIVE EXECUTED ({txid})"
+
                                 OrderLifecycleTracker.transition(
                                     intent.intent_id,
                                     OrderLifecycleState.FILLED,
                                     txid=txid,
-                                    filled_vol=live_res["volume"],
-                                    fee_eur=fee_eur
+                                    filled_vol=actual_vol,
+                                    fee_eur=actual_fee
                                 )
 
                                 pnl_eur = 0.0
                                 if live_res["side"] == "BUY":
-                                    self.live_entry_prices[asset_code] = live_res["price"]
-                                    self.live_peak_prices[asset_code] = live_res["price"]
                                     self.db_manager.record_buy_trade(
                                         timestamp=time.strftime("%H:%M:%S"),
                                         pair=pair_name,
-                                        price=live_res["price"],
-                                        volume=live_res["volume"],
-                                        fee_eur=fee_eur,
+                                        price=actual_price,
+                                        volume=actual_vol,
+                                        fee_eur=actual_fee,
                                         txid=txid,
-                                        status=f"🔴 LIVE EXECUTED ({txid})"
+                                        status=order_status_label
                                     )
+                                    # Einstiegspreis als VWAP der offenen Lots aktualisieren
+                                    vwap = self.db_manager.fetch_weighted_average_cost_basis(pair_name)
+                                    self.live_entry_prices[asset_code] = vwap if vwap else actual_price
+                                    self.live_peak_prices[asset_code] = actual_price
                                 elif live_res["side"] == "SELL":
                                     succ, calc_pnl = self.db_manager.record_sell_trade(
                                         timestamp=time.strftime("%H:%M:%S"),
                                         pair=pair_name,
-                                        price=live_res["price"],
-                                        volume=live_res["volume"],
-                                        fee_eur=fee_eur,
+                                        price=actual_price,
+                                        volume=actual_vol,
+                                        fee_eur=actual_fee,
                                         txid=txid,
-                                        status=f"🔴 LIVE EXECUTED ({txid})"
+                                        status=order_status_label
                                     )
                                     if calc_pnl is not None:
                                         # Known cost basis: safe to include in cumulative PnL
@@ -955,18 +1000,18 @@ class MultiExchangeTraderApp:
                                             f"({self._pnl_unknown_count} ungelöste Ereignisse)"
                                         )
                                     self.live_peak_prices[asset_code] = 0.0
-                                    # Hole aktualisierten Einstiegspreis verbleibender Lots
-                                    rem_lots = self.db_manager.fetch_open_lots(pair_name)
-                                    self.live_entry_prices[asset_code] = rem_lots[-1]["entry_price"] if rem_lots else 0.0
+                                    # Hole aktualisierten Einstiegspreis (VWAP) verbleibender Lots
+                                    vwap = self.db_manager.fetch_weighted_average_cost_basis(pair_name)
+                                    self.live_entry_prices[asset_code] = vwap if vwap else 0.0
 
                                 rec = {
                                     "timestamp": time.strftime("%H:%M:%S"),
                                     "side": live_res["side"],
-                                    "price": live_res["price"],
-                                    "volume": live_res["volume"],
-                                    "fee_eur": fee_eur,
+                                    "price": actual_price,
+                                    "volume": actual_vol,
+                                    "fee_eur": actual_fee,
                                     "pnl_eur": pnl_eur if pnl_eur is not None else "UNBEKANNT – Abstimmung",
-                                    "status": f"🔴 LIVE EXECUTED ({txid})"
+                                    "status": order_status_label
                                 }
 
                                 self.root.after(0, lambda r=rec: self.add_trade_to_ledger(r))
