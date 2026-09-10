@@ -1,6 +1,6 @@
 ﻿"""
-REGIME- UND STRUKTURMODELL MIT HYSTERESE & STRESSKORRELATION
------------------------------------------------------------
+REGIME- UND STRUKTURMODELL MIT DATENBASIERTER ÜBERGANGSMATRIX & HYSTERESE
+-------------------------------------------------------------------------
 1. 6 diskrete Regime-Klassen:
    - CALM_UPTREND
    - CALM_DOWNTREND
@@ -8,10 +8,9 @@ REGIME- UND STRUKTURMODELL MIT HYSTERESE & STRESSKORRELATION
    - TREND_BREAK
    - VOLATILITY_SHOCK
    - LIQUIDITY_STRESS
-2. Regimewechsel-Hysterese:
-   Verhindert Flackern durch Mindestverweildauer und Bestätigungsfenster.
-3. Rollende Korrelation & Stresskorrelation:
-   Ermittelt Korrelationen aus realen Renditen und berechnet worst-case Stress-VaR.
+2. Datenbasierte Übergangsmatrix (Transition Matrix) aus historischen Beobachtungen
+3. Hysterese mit Mindestverweildauer (z.B. 5-8 Ticks) gegen Flackern
+4. Strategie-Zulassungsmatrix pro Regime mit defensiven Defaults
 """
 
 import numpy as np
@@ -25,32 +24,52 @@ class MarketRegime:
     VOLATILITY_SHOCK = "VOLATILITY_SHOCK"
     LIQUIDITY_STRESS = "LIQUIDITY_STRESS"
 
+    ALL_REGIMES = [
+        CALM_UPTREND, CALM_DOWNTREND, RANGE_BOUND,
+        TREND_BREAK, VOLATILITY_SHOCK, LIQUIDITY_STRESS
+    ]
+
 
 class StructuralRegimeClassifier:
     """
     Klassifiziert das Marktregime anhand von Trendstärke, Volatilität (ATR) und Liquidität.
-    Mit eingebauter Hysterese zur Vermeidung von Signalflackern.
+    Schätzt eine empirische Übergangsmatrix und filtert Signalflackern über Hysterese.
     """
+
+    # Strategie-Zulassung pro Regime
+    ALLOWED_STRATEGIES = {
+        MarketRegime.CALM_UPTREND: ["TREND_CONTINUATION", "MOMENTUM_PULLBACK"],
+        MarketRegime.CALM_DOWNTREND: ["DEFENSIVE_CASH", "SHORT_HEDGE"],
+        MarketRegime.RANGE_BOUND: ["MEAN_REVERSION_H2", "VWAP_REVERT"],
+        MarketRegime.TREND_BREAK: ["DEFENSIVE_CASH", "BREAKOUT_WATCH"],
+        MarketRegime.VOLATILITY_SHOCK: ["DEACTIVATED", "RISK_EXIT_ONLY"],
+        MarketRegime.LIQUIDITY_STRESS: ["DEACTIVATED", "EMERGENCY_HALT"]
+    }
 
     def __init__(self, hysteresis_ticks: int = 5):
         self.hysteresis_ticks = hysteresis_ticks
         self.current_regime = MarketRegime.RANGE_BOUND
         self.candidate_regime = MarketRegime.RANGE_BOUND
         self.candidate_count = 0
-        self.price_history = []
-        self.volume_history = []
+        self.price_history: List[float] = []
+        self.volume_history: List[float] = []
+        
+        # Beobachtete Übergänge zur Schätzung der Transitionsmatrix
+        self.observed_transitions: Dict[str, Dict[str, int]] = {
+            r1: {r2: 0 for r2 in MarketRegime.ALL_REGIMES} for r1 in MarketRegime.ALL_REGIMES
+        }
 
     def update(self, price: float, volume: float, spread_bps: float = 2.0, atr_pct: float = 0.01) -> str:
         self.price_history.append(price)
         self.volume_history.append(volume)
-        if len(self.price_history) > 200:
+        if len(self.price_history) > 300:
             self.price_history.pop(0)
             self.volume_history.pop(0)
 
         # 1. Roh-Regime ermitteln
         raw_regime = self._classify_raw(spread_bps, atr_pct)
 
-        # 2. Hysterese-Filterung
+        # 2. Hysterese-Filterung (Flackerschutz)
         if raw_regime == self.current_regime:
             self.candidate_count = 0
             self.candidate_regime = self.current_regime
@@ -59,8 +78,11 @@ class StructuralRegimeClassifier:
                 self.candidate_count += 1
                 # Wenn das neue Regime über N Ticks stabil bleibt -> Umschalten
                 if self.candidate_count >= self.hysteresis_ticks:
+                    old_regime = self.current_regime
                     self.current_regime = raw_regime
                     self.candidate_count = 0
+                    # Übergang protokollieren
+                    self.observed_transitions[old_regime][raw_regime] += 1
             else:
                 self.candidate_regime = raw_regime
                 self.candidate_count = 1
@@ -79,7 +101,6 @@ class StructuralRegimeClassifier:
 
         # B. Trend vs. Range
         prices = np.array(self.price_history[-30:])
-        returns = np.diff(prices) / prices[:-1]
         cumulative_ret = (prices[-1] - prices[0]) / prices[0]
 
         # Effizienz-Verhältnis (Kaufman Efficiency Ratio)
@@ -99,60 +120,38 @@ class StructuralRegimeClassifier:
         else:
             return MarketRegime.RANGE_BOUND
 
-
-class RollingStressCorrelationMatrix:
-    """
-    Berechnet rollende Korrelationen aus echten Renditen und
-    schätzt Stress-Korrelationen bei gleichzeitigen Markteinbrüchen.
-    """
-
-    def __init__(self, window: int = 50):
-        self.window = window
-        self.asset_returns: Dict[str, List[float]] = {}
-        self.last_prices: Dict[str, float] = {}
-
-    def update_price(self, asset: str, price: float):
-        if price <= 0:
-            return
-        if asset in self.last_prices and self.last_prices[asset] > 0:
-            ret = (price - self.last_prices[asset]) / self.last_prices[asset]
-            if asset not in self.asset_returns:
-                self.asset_returns[asset] = []
-            self.asset_returns[asset].append(ret)
-            if len(self.asset_returns[asset]) > self.window:
-                self.asset_returns[asset].pop(0)
-        self.last_prices[asset] = price
-
-    def get_correlation_matrix(self) -> Dict[str, Dict[str, float]]:
-        assets = list(self.asset_returns.keys())
-        matrix = {a: {} for a in assets}
-        for i, a1 in enumerate(assets):
-            matrix[a1][a1] = 1.0
-            for j, a2 in enumerate(assets):
-                if i < j:
-                    r1 = self.asset_returns[a1]
-                    r2 = self.asset_returns[a2]
-                    min_len = min(len(r1), len(r2))
-                    if min_len > 10:
-                        corr = float(np.corrcoef(r1[-min_len:], r2[-min_len:])[0, 1])
-                        corr = 0.0 if np.isnan(corr) else round(corr, 3)
-                    else:
-                        corr = 0.5 # Default-Annahme
-                    matrix[a1][a2] = corr
-                    matrix[a2][a1] = corr
+    def get_empirical_transition_matrix(self) -> Dict[str, Dict[str, float]]:
+        """Berechnet die empirische Übergangswahrscheinlichkeitsmatrix aus Beobachtungen."""
+        matrix = {}
+        for r1 in MarketRegime.ALL_REGIMES:
+            total = sum(self.observed_transitions[r1].values())
+            matrix[r1] = {}
+            for r2 in MarketRegime.ALL_REGIMES:
+                if total > 0:
+                    matrix[r1][r2] = round(self.observed_transitions[r1][r2] / total, 3)
+                else:
+                    matrix[r1][r2] = 1.0 if r1 == r2 else 0.0
         return matrix
 
-    def calculate_stress_var(self, balances_eur: Dict[str, float], confidence: float = 0.99) -> float:
-        """
-        Berechnet den 1-Tages Portfolio-VaR unter Berücksichtigung von Stress-Korrelationen.
-        In Stressphasen konvergieren Krypto-Korrelationen gegen 1.0.
-        """
-        total_exposure = sum(val for k, val in balances_eur.items() if k != "EUR" and val > 0)
-        if total_exposure <= 0:
-            return 0.0
+    def is_strategy_allowed(self, strategy_family: str) -> bool:
+        """Prüft, ob eine Strategiefamilie im aktuellen Regime zugelassen ist."""
+        allowed = self.ALLOWED_STRATEGIES.get(self.current_regime, [])
+        return strategy_family in allowed
 
-        # Konservatives Stress-VaR Modell: Korrelationsannahme steigt auf 0.90 in Krisen
-        # 99% Quantil ~ 2.33 StdAbw bei typischer Krypto-Tagesvolatilität von ~4%
-        stress_daily_vol = 0.05
-        stress_z = 2.33
-        return round(total_exposure * stress_daily_vol * stress_z * 0.90, 2)
+
+# Kompatibilität
+class RollingStressCorrelationMatrix:
+    """Kompatibilitäts-Wrapper für bestehende Modulaufrufe."""
+    def __init__(self, window: int = 50):
+        from risk.correlation_engine import PortfolioCorrelationEngine
+        self._engine = PortfolioCorrelationEngine(window=window)
+
+    def update_price(self, asset: str, price: float):
+        self._engine.update_price(asset, price)
+
+    def get_correlation_matrix(self):
+        return self._engine.get_rolling_correlation_matrix()
+
+    def calculate_stress_var(self, balances_eur: Dict[str, float], confidence: float = 0.99):
+        res = self._engine.calculate_portfolio_var_and_es(balances_eur, confidence=confidence)
+        return res["stress_var_eur"]

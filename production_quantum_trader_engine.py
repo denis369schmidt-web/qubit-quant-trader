@@ -44,6 +44,8 @@ from institutional_trading_core import (
     OrderLifecycleTracker,
     OrderLifecycleState
 )
+from risk.regime_models import StructuralRegimeClassifier, MarketRegime
+from risk.correlation_engine import PortfolioCorrelationEngine
 from multi_exchange_websocket_engine import MultiExchangeWebSocketManager
 from stat_arb_kelly_engine import (
     StatisticalArbitrageEngine,
@@ -257,6 +259,15 @@ class MultiExchangeTraderApp:
         self.paper_simulator = PaperTradingSimulator(initial_balance_eur=1000.0, taker_fee_pct=0.0026)
         self.backtester = QuantitativeBacktester(initial_capital_eur=1000.0)
         self.db_manager = SQLiteTradeLedgerManager()
+        self.structural_regime_clf = StructuralRegimeClassifier(hysteresis_ticks=5)
+        self.correlation_engine = PortfolioCorrelationEngine(window=60)
+        self.last_var_data: Dict[str, float] = {
+            "var_eur": 0.0,
+            "cvar_es_eur": 0.0,
+            "stress_var_eur": 0.0,
+            "exposure_throttle_factor": 1.0
+        }
+        self.active_market_regime: str = MarketRegime.RANGE_BOUND
 
         self.real_balances: Dict[str, float] = {}
         self.real_equity_eur = 0.0
@@ -797,8 +808,49 @@ class MultiExchangeTraderApp:
                 win_rate_est = max(min(self.paper_simulator.winning_trades / max(self.paper_simulator.total_trades, 1), 0.85), 0.40)
                 kelly_f = KellyCriterionManager.calculate_kelly_fraction(win_rate_est, risk_reward_ratio=2.0, safety_fraction=0.5)
 
-                # ML Regime Classification für Leitwährung (BTC)
-                regime_res = QuantitativeRegimeClassifier.classify_market_regime(self.asset_price_histories["BTC"])
+                # Rolling Correlation & Tail-Risk Engine Update
+                for a_code, p_val in live_asset_prices.items():
+                    if p_val > 0:
+                        self.correlation_engine.update_price(a_code, p_val)
+
+                # ML / Quantitative Regime Classification mit Hysterese für Leitwährung (BTC)
+                btc_p = live_asset_prices.get("BTC", kraken_p if kraken_p > 0 else 65000.0)
+                btc_atr = atr_dict.get("BTC", 0.0)
+                btc_atr_pct = (btc_atr / btc_p) if (btc_p > 0 and btc_atr > 0) else 0.01
+                k_spread_bps = 2.0
+                if "Kraken" in self.ws_manager.orderbooks:
+                    k_b = self.ws_manager.orderbooks["Kraken"].get("bids", [])
+                    k_a = self.ws_manager.orderbooks["Kraken"].get("asks", [])
+                    if k_b and k_a and len(k_b) > 0 and len(k_a) > 0 and k_b[0][0] > 0 and k_a[0][0] > 0:
+                        k_spread_bps = max(0.5, (k_a[0][0] - k_b[0][0]) / k_b[0][0] * 10000.0)
+
+                vol_b = 10.0
+                if "Kraken" in self.ws_manager.orderbooks:
+                    vol_b = sum(b[1] for b in self.ws_manager.orderbooks["Kraken"].get("bids", [])[:5])
+
+                self.active_market_regime = self.structural_regime_clf.update(
+                    price=btc_p,
+                    volume=vol_b,
+                    spread_bps=k_spread_bps,
+                    atr_pct=btc_atr_pct
+                )
+
+                if self.trading_mode == "PAPER":
+                    allocator_balances = self.paper_simulator.get_balances()
+                else:
+                    allocator_balances = self.real_balances
+
+                self.last_var_data = self.correlation_engine.calculate_portfolio_var_and_es(allocator_balances)
+
+                regime_res = {
+                    "regime": self.active_market_regime,
+                    "confidence": 0.85,
+                    "rsi_buy": 40 if self.active_market_regime in [MarketRegime.RANGE_BOUND, MarketRegime.CALM_UPTREND] else 30,
+                    "rsi_sell": 60 if self.active_market_regime in [MarketRegime.RANGE_BOUND, MarketRegime.CALM_DOWNTREND] else 70,
+                    "strategy": "MEAN_REVERSION_H2" if self.active_market_regime == MarketRegime.RANGE_BOUND else "TREND_FOLLOWING",
+                    "exposure_throttle_factor": self.last_var_data.get("exposure_throttle_factor", 1.0),
+                    "var_data": self.last_var_data
+                }
 
                 if self.sensitivity_mode == "SCALP":
                     rsi_buy_thresh = 45
@@ -914,7 +966,8 @@ class MultiExchangeTraderApp:
                     regime_data=regime_res,
                     lead_lag_data=lead_lag,
                     cash_reserve_ratio=0.05,
-                    compounding_mult=compounding_mult
+                    compounding_mult=compounding_mult,
+                    correlation_data=self.last_var_data
                 )
 
                 # 1. Daily Equity Circuit Breaker (Notaus bei >5% Tages-Drawdown)

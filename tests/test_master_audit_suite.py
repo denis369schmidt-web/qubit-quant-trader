@@ -1,4 +1,4 @@
-﻿"""
+"""
 MASTER AUDIT & VALIDATION TEST SUITE (P0 / P1)
 ----------------------------------------------
 Prüft deterministisch alle 13 geforderten Architektur- & Risikopunkte:
@@ -30,7 +30,8 @@ from institutional_trading_core import (
     SQLiteTradeLedgerManager,
     KrakenLiveGateway,
     OrderLifecycleTracker,
-    OrderLifecycleState
+    OrderLifecycleState,
+    MultiAssetWalletAllocator
 )
 from execution.cost_execution_model import RealisticExecutionModel, LatencyTelemetryTracker
 from risk.regime_models import StructuralRegimeClassifier, MarketRegime, RollingStressCorrelationMatrix
@@ -231,6 +232,75 @@ class MasterAuditTestSuite(unittest.TestCase):
         summary = tracker.get_summary()
         self.assertAlmostEqual(summary["avg_total_ms"], 165.6, places=1)
         self.assertEqual(summary["sample_count"], 1)
+
+    # 14. Regime-Gating sperrt Neukäufe in Schock/Stress
+    def test_14_regime_gating_blocks_buys(self):
+        balances = {"EUR": 1000.0}
+        signals = {"BTC": "BUY"}
+        prices = {"BTC": 60000.0}
+        rsi = {"BTC": 25.0}  # Extrem überverkauft
+        obi = {"BTC": 0.50}
+
+        # Im RANGE_BOUND Regime: Kauf muss stattfinden
+        orders_normal = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
+            balances=balances, asset_signals=signals, live_prices=prices,
+            rsi_scores=rsi, obi_scores=obi, regime_data={"regime": MarketRegime.RANGE_BOUND}
+        )
+        self.assertTrue(any(o["side"] == "BUY" for o in orders_normal))
+
+        # Im VOLATILITY_SHOCK Regime: Neukäufe müssen strikt gesperrt sein!
+        orders_shock = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
+            balances=balances, asset_signals=signals, live_prices=prices,
+            rsi_scores=rsi, obi_scores=obi, regime_data={"regime": MarketRegime.VOLATILITY_SHOCK}
+        )
+        self.assertFalse(any(o["side"] == "BUY" for o in orders_shock), "VOLATILITY_SHOCK darf keine Käufe generieren")
+
+        # Im LIQUIDITY_STRESS Regime: Neukäufe müssen ebenfalls strikt gesperrt sein!
+        orders_stress = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
+            balances=balances, asset_signals=signals, live_prices=prices,
+            rsi_scores=rsi, obi_scores=obi, regime_data={"regime": MarketRegime.LIQUIDITY_STRESS}
+        )
+        self.assertFalse(any(o["side"] == "BUY" for o in orders_stress), "LIQUIDITY_STRESS darf keine Käufe generieren")
+
+    # 15. Stress-Korrelation drosselt Exposure dynamisch
+    def test_15_stress_correlation_exposure_throttling(self):
+        balances = {"EUR": 1000.0}
+        signals = {"BTC": "BUY"}
+        prices = {"BTC": 60000.0}
+        rsi = {"BTC": 25.0}
+        obi = {"BTC": 0.50}
+
+        orders_unthrottled = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
+            balances=balances, asset_signals=signals, live_prices=prices,
+            rsi_scores=rsi, obi_scores=obi, correlation_data={"exposure_throttle_factor": 1.0}
+        )
+        orders_throttled = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
+            balances=balances, asset_signals=signals, live_prices=prices,
+            rsi_scores=rsi, obi_scores=obi, correlation_data={"exposure_throttle_factor": 0.25}
+        )
+        self.assertTrue(len(orders_unthrottled) > 0)
+        self.assertTrue(len(orders_throttled) > 0)
+        vol_unthrottled = orders_unthrottled[0]["volume"]
+        vol_throttled = orders_throttled[0]["volume"]
+        self.assertLess(vol_throttled, vol_unthrottled, "Drosselungsfaktor muss Order-Volumen reduzieren")
+
+    # 16. Priorisierter Stop Loss (RISK_EXIT) bei Kurseinbruch
+    def test_16_prioritized_risk_exit_on_stop_loss(self):
+        balances = {"EUR": 500.0, "BTC": 0.05}
+        signals = {"BTC": "HOLD"}
+        entry_prices = {"BTC": 60000.0}
+        # Preis bricht ein auf 57000 (-5.0%)
+        crash_prices = {"BTC": 57000.0}
+        atr_scores = {"BTC": 1200.0}  # ATR Stop ca. 2-3%
+
+        orders = MultiAssetWalletAllocator.evaluate_multi_asset_opportunities(
+            balances=balances, asset_signals=signals, live_prices=crash_prices,
+            entry_prices=entry_prices, atr_scores=atr_scores
+        )
+        risk_exits = [o for o in orders if o.get("exit_type") == "RISK_EXIT"]
+        self.assertTrue(len(risk_exits) > 0, "Stop Loss muss sofort einen RISK_EXIT auslösen")
+        self.assertEqual(risk_exits[0]["side"], "SELL")
+        self.assertEqual(risk_exits[0]["asset"], "BTC")
 
 if __name__ == "__main__":
     unittest.main()

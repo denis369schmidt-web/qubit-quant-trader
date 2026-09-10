@@ -877,7 +877,8 @@ class MultiAssetWalletAllocator:
         regime_data: Optional[Dict[str, Any]] = None,
         lead_lag_data: Optional[Dict[str, Any]] = None,
         cash_reserve_ratio: float = 0.05,
-        compounding_mult: float = 1.0
+        compounding_mult: float = 1.0,
+        correlation_data: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         executable_orders = []
         eur_cash = balances.get("EUR", 0.0)
@@ -894,20 +895,24 @@ class MultiAssetWalletAllocator:
         curr_regime = regime_data.get("regime", "RANGE_SCALPING")
 
         # Dynamische Multiplikatoren basierend auf Marktregime
-        if curr_regime == "TRENDING_BULL":
+        if curr_regime in ["TRENDING_BULL", "CALM_UPTREND"]:
             sl_mult, tp_mult = 1.5, 4.0
             min_tp, max_tp = 0.030, 0.100
             min_sl, max_sl = 0.015, 0.035
-        elif curr_regime == "TRENDING_BEAR":
+        elif curr_regime in ["TRENDING_BEAR", "CALM_DOWNTREND", "TREND_BREAK"]:
             sl_mult, tp_mult = 1.0, 1.8
             min_tp, max_tp = 0.015, 0.040
             min_sl, max_sl = 0.010, 0.025
-        else: # RANGE_SCALPING
+        elif curr_regime in ["VOLATILITY_SHOCK", "LIQUIDITY_STRESS"]:
+            sl_mult, tp_mult = 0.8, 1.5
+            min_tp, max_tp = 0.010, 0.030
+            min_sl, max_sl = 0.010, 0.020
+        else: # RANGE_SCALPING / RANGE_BOUND
             sl_mult, tp_mult = 1.2, 2.5
             min_tp, max_tp = 0.020, 0.060
             min_sl, max_sl = 0.010, 0.030
 
-        # Gebühren- & Gewinnschwellen für 100% garantierten Kapitalzuwachs
+        # Gebühren- & Gewinnschwellen für garantierten Kapitalzuwachs
         roundtrip_fee_pct = 0.0052   # 0.26% Taker Fee Kauf + 0.26% Taker Fee Verkauf
         min_net_profit_pct = 0.0020  # Mindestens +0.20% Netto-Reingewinn nach allen Gebühren!
 
@@ -941,7 +946,21 @@ class MultiAssetWalletAllocator:
                     peak_ret = (peak_p - entry_p) / entry_p
                     pullback_from_peak = (peak_p - price) / peak_p if peak_p > 0 else 0.0
 
-                    # 1. DYNAMISCHER TRAILING PROFIT LOCK (PROFIT_EXIT: Gewinne sichern ab +1.5% Peak)
+                    # 1. CAPITAL PRESERVATION STOP LOSS / CIRCUIT BREAKER (RISK_EXIT)
+                    # Absolute Priorität: Schützt das Portfolio sofort vor Tail-Verlusten basierend auf dynamischem ATR-Stop oder Crash
+                    if price <= entry_p * (1.0 - sl_dist_pct) or price <= entry_p * 0.950:
+                        executable_orders.append({
+                            "pair": pair,
+                            "side": "SELL",
+                            "asset": asset,
+                            "volume": bal * 0.999,
+                            "price": price,
+                            "exit_type": "RISK_EXIT",
+                            "reason": f"🚨 Stop-Loss Risiko-Schutz (-{((entry_p - price)/entry_p*100):.2f}% vs. Stop-Schwelle {sl_dist_pct*100:.1f}%) für {asset}"
+                        })
+                        continue
+
+                    # 2. DYNAMISCHER TRAILING PROFIT LOCK (PROFIT_EXIT: Gewinne sichern ab +1.5% Peak)
                     if peak_ret >= 0.015 and pullback_from_peak >= 0.004 and price >= fee_threshold_price:
                         executable_orders.append({
                             "pair": pair,
@@ -954,7 +973,7 @@ class MultiAssetWalletAllocator:
                         })
                         continue
 
-                    # 2. RATCHET BREAK-EVEN ABSICHERUNG (PROFIT_EXIT: Verhindert, dass Gewinner zu Verlierern werden)
+                    # 3. RATCHET BREAK-EVEN ABSICHERUNG (PROFIT_EXIT: Verhindert, dass Gewinner zu Verlierern werden)
                     if peak_ret >= 0.0080 and price <= entry_p * (1.0 + roundtrip_fee_pct + 0.0010) and price >= fee_threshold_price:
                         executable_orders.append({
                             "pair": pair,
@@ -967,7 +986,7 @@ class MultiAssetWalletAllocator:
                         })
                         continue
 
-                    # 3. TAKE-PROFIT ZIEL (PROFIT_EXIT)
+                    # 4. TAKE-PROFIT ZIEL (PROFIT_EXIT)
                     if price >= entry_p * (1.0 + tp_dist_pct) and price >= fee_threshold_price:
                         executable_orders.append({
                             "pair": pair,
@@ -977,19 +996,6 @@ class MultiAssetWalletAllocator:
                             "price": price,
                             "exit_type": "PROFIT_EXIT",
                             "reason": f"🎯 Take-Profit Ziel (+{gross_ret*100:.2f}%) für {asset} [{curr_regime}]"
-                        })
-                        continue
-
-                    # 4. EXTREMER NOTFALL-CIRCUIT-BREAKER (RISK_EXIT: Nur bei extremem Crash > -5.0%)
-                    if price <= entry_p * 0.950:
-                        executable_orders.append({
-                            "pair": pair,
-                            "side": "SELL",
-                            "asset": asset,
-                            "volume": bal * 0.999,
-                            "price": price,
-                            "exit_type": "RISK_EXIT",
-                            "reason": f"🚨 Notfall-Stop Schutz (-{sl_dist_pct*100:.1f}%) für {asset}"
                         })
                         continue
 
@@ -1009,55 +1015,67 @@ class MultiAssetWalletAllocator:
                             })
 
         # 2. HIGH-CONVICTION BUYING (Streng selektives Einstiegs-Gating & Kapitalerhalt)
+        # In Schock-, Liquiditätsstress- oder Notfall-Regimes sind Neukäufe strikt gesperrt!
+        is_buy_gated = curr_regime in [
+            "VOLATILITY_SHOCK", "LIQUIDITY_STRESS", "DEACTIVATED", "EMERGENCY_HALT"
+        ]
+
+        throttle_factor = 1.0
+        if correlation_data and isinstance(correlation_data, dict):
+            throttle_factor = correlation_data.get("exposure_throttle_factor", 1.0)
+        elif regime_data and isinstance(regime_data, dict) and "exposure_throttle_factor" in regime_data:
+            throttle_factor = regime_data.get("exposure_throttle_factor", 1.0)
+
         buy_candidates = []
-        for pair, limits in KrakenLiveGateway.PAIR_LIMITS.items():
-            asset = limits["asset"]
-            price = live_prices.get(asset, 0.0)
-            if asset_signals.get(asset) == "BUY" and price > 0:
-                obi_val = obi_scores.get(asset, 0.0)
-                cvd_data = cvd_scores.get(asset, {})
+        if not is_buy_gated:
+            for pair, limits in KrakenLiveGateway.PAIR_LIMITS.items():
+                asset = limits["asset"]
+                price = live_prices.get(asset, 0.0)
+                if asset_signals.get(asset) == "BUY" and price > 0:
+                    obi_val = obi_scores.get(asset, 0.0)
+                    cvd_data = cvd_scores.get(asset, {})
+                    
+                    # Hochkonvexe Einstiegsfilter: Nur bei echter Marktliquidität & Käuferdruck einsteigen
+                    if obi_val >= 0.00 and cvd_data.get("absorption") != "BEARISH_WALL":
+                        min_cost = max(limits["costmin"], limits["ordermin"] * price)
+                        # Cash-Reserve & Drosselung durch Korrelationsstress / Tail-VaR
+                        usable_cash = max(0.0, (eur_cash - 0.50) * (1.0 - cash_reserve_ratio)) * throttle_factor
+                        if usable_cash >= min_cost + 0.50:
+                            asset_rsi = rsi_scores.get(asset, 50.0)
+                            
+                            # Berechnung des Composite Edge Scores (0.0 bis 1.0+)
+                            rsi_edge = max(0.0, (50.0 - asset_rsi) / 50.0)
+                            obi_edge = max(0.0, obi_val + 0.10)
+                            cvd_edge = 1.0 if cvd_data.get("absorption") == "BULLISH_ABSORPTION" else 0.5
+                            lead_lag_edge = 1.0 if lead_lag_data.get("action") == "BOOST_BUY" else 0.5
+
+                            composite_score = (0.35 * rsi_edge) + (0.30 * obi_edge) + (0.20 * cvd_edge) + (0.15 * lead_lag_edge)
+                            
+                            # Nur Trades mit solidem statistischem Vorsprung zulassen
+                            if composite_score >= 0.40:
+                                buy_candidates.append((composite_score, pair, asset, price, min_cost, usable_cash))
+
+            if buy_candidates:
+                buy_candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_pair, best_asset, best_price, min_cost, usable_cash = buy_candidates[0]
+                limits = KrakenLiveGateway.PAIR_LIMITS[best_pair]
                 
-                # Hochkonvexe Einstiegsfilter: Nur bei echter Marktliquidität & Käuferdruck einsteigen
-                if obi_val >= 0.00 and cvd_data.get("absorption") != "BEARISH_WALL":
-                    min_cost = max(limits["costmin"], limits["ordermin"] * price)
-                    # 60% Cash bleibt stets als eiserne Reserve geschützt
-                    usable_cash = max(0.0, (eur_cash - 0.50) * (1.0 - cash_reserve_ratio))
-                    if usable_cash >= min_cost + 0.50:
-                        asset_rsi = rsi_scores.get(asset, 50.0)
-                        
-                        # Berechnung des Composite Edge Scores (0.0 bis 1.0+)
-                        rsi_edge = max(0.0, (50.0 - asset_rsi) / 50.0)
-                        obi_edge = max(0.0, obi_val + 0.10)
-                        cvd_edge = 1.0 if cvd_data.get("absorption") == "BULLISH_ABSORPTION" else 0.5
-                        lead_lag_edge = 1.0 if lead_lag_data.get("action") == "BOOST_BUY" else 0.5
-
-                        composite_score = (0.35 * rsi_edge) + (0.30 * obi_edge) + (0.20 * cvd_edge) + (0.15 * lead_lag_edge)
-                        
-                        # Nur Trades mit solidem statistischem Vorsprung zulassen
-                        if composite_score >= 0.40:
-                            buy_candidates.append((composite_score, pair, asset, price, min_cost, usable_cash))
-
-        if buy_candidates:
-            buy_candidates.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_pair, best_asset, best_price, min_cost, usable_cash = buy_candidates[0]
-            limits = KrakenLiveGateway.PAIR_LIMITS[best_pair]
-            
-            # Intelligente Positionsgröße: Max 35% des verfügbaren Cash investieren
-            # Verbleibende 65% sind 100% sicher in EUR Barreserve
-            max_alloc_ratio = min(0.35 * compounding_mult, 0.45)
-            target_amount = max(usable_cash * max_alloc_ratio, min_cost * 1.05)
-            invest_amount = min(target_amount, usable_cash * 0.95)
-            
-            buy_vol = invest_amount / best_price
-            if buy_vol >= limits["ordermin"] * 1.01 and invest_amount >= limits["costmin"]:
-                executable_orders.append({
-                    "pair": best_pair,
-                    "side": "BUY",
-                    "asset": best_asset,
-                    "volume": buy_vol,
-                    "price": best_price,
-                    "reason": f"⚡ High-Conviction Kauf {best_asset} (Score: {best_score:.2f}, Allokation: {invest_amount:.2f} € [{max_alloc_ratio*100:.0f}%])"
-                })
+                # Intelligente Positionsgröße: Max 35% des verfügbaren Cash investieren
+                # Verbleibende Cash-Mittel sind sicher in EUR Barreserve
+                max_alloc_ratio = min(0.35 * compounding_mult * throttle_factor, 0.45)
+                target_amount = max(usable_cash * max_alloc_ratio, min_cost * 1.05)
+                invest_amount = min(target_amount, usable_cash * 0.95)
+                
+                buy_vol = invest_amount / best_price
+                if buy_vol >= limits["ordermin"] * 1.01 and invest_amount >= limits["costmin"]:
+                    executable_orders.append({
+                        "pair": best_pair,
+                        "side": "BUY",
+                        "asset": best_asset,
+                        "volume": buy_vol,
+                        "price": best_price,
+                        "reason": f"⚡ High-Conviction Kauf {best_asset} (Score: {best_score:.2f}, Allokation: {invest_amount:.2f} € [{max_alloc_ratio*100:.0f}%], Throttle: {throttle_factor:.2f})"
+                    })
 
         return executable_orders
 
