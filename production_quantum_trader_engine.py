@@ -865,31 +865,6 @@ class MultiExchangeTraderApp:
                     rsi_sell_thresh = regime_res.get("rsi_sell", 60)
                     z_thresh = 1.5
 
-                # VALIDIERTE STRATEGIE-ENGINE: HYPOTHESE H2 (MEAN-REVERSION NACH ERSCHÖPFUNG)
-                # Kauft nur bei statistischer Extrem-Auslenkung (> 2.0 - 2.2 StdAbw vom Mittelwert)
-                # und OBI/CVD-Kaufdruck-Bestätigung.
-                asset_signals = {}
-                for a_sym, a_rsi in rsi_dict.items():
-                    p_hist = self.asset_price_histories.get(a_sym, [])
-                    if len(p_hist) >= 20:
-                        p_arr = np.array(p_hist[-30:])
-                        p_mean = float(np.mean(p_arr))
-                        p_std = float(np.std(p_arr))
-                        cur_p = p_hist[-1]
-
-                        # H2 Einstiegsbedingung: Kurs signifikant unter Mean (> 2.0 StdAbw)
-                        is_exhaustion_dip = (cur_p < (p_mean - 2.0 * p_std)) if p_std > 0 else False
-                        is_rsi_oversold = (a_rsi < rsi_buy_thresh)
-
-                        if (is_exhaustion_dip or is_rsi_oversold) and cur_p > 0:
-                            asset_signals[a_sym] = "BUY"
-                        elif cur_p >= p_mean and (a_rsi > rsi_sell_thresh):
-                            asset_signals[a_sym] = "SELL"
-                        else:
-                            asset_signals[a_sym] = "HOLD"
-                    else:
-                        asset_signals[a_sym] = "HOLD"
-
                 # P1-A: Echte OBI Scores & CVD Absorption Radar berechnen PRO ASSET
                 obi_dict = {}
                 cvd_dict = {}
@@ -908,6 +883,33 @@ class MultiExchangeTraderApp:
                     cvd_dict["BTC"] = TechnicalAnalysisEngine.calculate_cvd_absorption(k_bids, k_asks)
 
                 cvd_data = cvd_dict.get("BTC", {})
+
+                # VALIDIERTE STRATEGIE-ENGINE: HYPOTHESE H2 (MEAN-REVERSION NACH ERSCHÖPFUNG)
+                # Kauft nur bei statistischer Extrem-Auslenkung (> 2.0 StdAbw vom Mittelwert)
+                # UND bestätigtem OBI/Käuferdruck (kein blindes Hineingreifen in freie Abstürze).
+                asset_signals = {}
+                for a_sym, a_rsi in rsi_dict.items():
+                    p_hist = self.asset_price_histories.get(a_sym, [])
+                    if len(p_hist) >= 20:
+                        p_arr = np.array(p_hist[-30:])
+                        p_mean = float(np.mean(p_arr))
+                        p_std = float(np.std(p_arr))
+                        cur_p = p_hist[-1]
+                        a_obi = obi_dict.get(a_sym, 0.0)
+
+                        # H2 Einstiegsbedingung: Kurs signifikant unter Mean (> 2.0 StdAbw) UND überverkauft UND OBI-Käuferabstützung
+                        is_exhaustion_dip = (cur_p < (p_mean - 2.0 * p_std)) if p_std > 0 else False
+                        is_rsi_oversold = (a_rsi < rsi_buy_thresh)
+                        has_liquidity_support = (a_obi >= 0.0)
+
+                        if is_exhaustion_dip and is_rsi_oversold and has_liquidity_support and cur_p > 0:
+                            asset_signals[a_sym] = "BUY"
+                        elif cur_p >= p_mean and (a_rsi > rsi_sell_thresh):
+                            asset_signals[a_sym] = "SELL"
+                        else:
+                            asset_signals[a_sym] = "HOLD"
+                    else:
+                        asset_signals[a_sym] = "HOLD"
 
                 # Binance Lead-Lag Signal abfragen
                 lead_lag = self.ws_manager.get_binance_lead_lag_signal()

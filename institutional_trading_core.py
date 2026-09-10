@@ -1060,10 +1060,24 @@ class MultiAssetWalletAllocator:
                 best_score, best_pair, best_asset, best_price, min_cost, usable_cash = buy_candidates[0]
                 limits = KrakenLiveGateway.PAIR_LIMITS[best_pair]
                 
+                # Mathematisches Risiko-Budget: 1.0% der Gesamt-Equity riskieren, geteilt durch Stop-Distanz
+                total_equity_est = eur_cash + sum(balances.get(KrakenLiveGateway.PAIR_LIMITS[p]["asset"], 0.0) * live_prices.get(KrakenLiveGateway.PAIR_LIMITS[p]["asset"], 0.0) for p in KrakenLiveGateway.PAIR_LIMITS)
+                risk_budget_eur = max(total_equity_est, eur_cash) * 0.010
+                
+                atr_val = atr_scores.get(best_asset, 0.0)
+                if atr_val > 0 and best_price > 0:
+                    asset_sl_dist = max(min_sl, min(max_sl, (sl_mult * atr_val) / best_price))
+                else:
+                    asset_sl_dist = 0.020
+                
+                risk_sized_amount = risk_budget_eur / max(asset_sl_dist, 0.010)
+
                 # Intelligente Positionsgröße: Max 35% des verfügbaren Cash investieren
                 # Verbleibende Cash-Mittel sind sicher in EUR Barreserve
                 max_alloc_ratio = min(0.35 * compounding_mult * throttle_factor, 0.45)
-                target_amount = max(usable_cash * max_alloc_ratio, min_cost * 1.05)
+                cash_limit_amount = usable_cash * max_alloc_ratio
+                target_amount = min(risk_sized_amount, cash_limit_amount)
+                target_amount = max(target_amount, min_cost * 1.05)
                 invest_amount = min(target_amount, usable_cash * 0.95)
                 
                 buy_vol = invest_amount / best_price
