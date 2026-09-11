@@ -1,0 +1,39 @@
+﻿# ==============================================================================
+# QUBIT SYSTEMATIC TRADER - CENTRAL CONFIGURATION (YAML)
+# ==============================================================================
+
+trading:
+  default_mode: "PAPER"              # PAPER | LIVE_READ_ONLY | LIVE
+  timeframe_seconds: 300             # 300s = 5-Minuten-Kerzen
+  resample_timeframe_seconds: 900    # 900s = 15-Minuten-Kerzen
+  universe:
+    - "XBTEUR"
+    - "ETHEUR"
+    - "SOLEUR"
+    - "XRPEUR"
+
+risk_management:
+  max_risk_per_trade_pct: 0.010      # Max 1.0% des Gesamtkapitals Risiko pro Trade
+  max_total_exposure_pct: 0.50       # Max 50% Gesamtportfolio in Krypto investiert
+  max_asset_allocation_pct: 0.35     # Max 35% Portfolio in ein einzelnes Asset
+  daily_loss_limit_pct: 0.030        # Max 3.0% Tagesverlust -> Automatische Handelspause
+  weekly_loss_limit_pct: 0.060       # Max 6.0% Wochenverlust -> Notstopp
+  min_stop_distance_pct: 0.010       # Mindestens 1.0% Stop-Abstand gegen Markt-Rauschen
+
+execution:
+  execution_style: "MAKER_POST_ONLY" # MAKER_POST_ONLY (0.40% Fee, kein Taker-Slippage) oder MARKET_TAKER
+  post_only: true                    # Kraken 'post'-Flag: Garantiert Maker-Gebühr
+  stale_order_timeout_sec: 30.0      # Unausgeführte Limit-Orders nach 30s stornieren
+  min_order_cost_eur: 0.45           # Kraken Minimaler Orderwert in EUR
+  verify_expectancy_before_entry: true # Blockiert Trades mit statistischem Edge < Roundtrip-Kosten
+
+reconciliation:
+  enabled: true
+  interval_seconds: 60.0             # Alle 60s Abgleich mit Kraken /0/private/TradesHistory
+  auto_sync_external_trades: true
+
+regimes:
+  blocked_entry_regimes:
+    - "LIQUIDITY_STRESS"
+    - "VOLATILITY_SHOCK"
+    - "CALM_DOWNTREND"

@@ -1,4 +1,4 @@
-﻿"""
+"""
 KORRELATIONS-, KLUMPENRISIKO- UND PORTFOLIO-STRESS-ENGINE
 ---------------------------------------------------------
 1. Rollende Korrelationen aus echten Renditen
@@ -91,6 +91,19 @@ class PortfolioCorrelationEngine:
                     
                     matrix[a1][a2] = round(stress_corr, 3)
                     matrix[a2][a1] = round(stress_corr, 3)
+
+        # Mathematische Garantie: Matrix muss positiv semidefinit (PSD) sein
+        if len(assets) > 1:
+            arr = np.array([[matrix[a1][a2] for a2 in assets] for a1 in assets])
+            arr = (arr + arr.T) / 2.0
+            eigvals, eigvecs = np.linalg.eigh(arr)
+            eigvals_clipped = np.maximum(eigvals, 1e-6)
+            arr_psd = eigvecs @ np.diag(eigvals_clipped) @ eigvecs.T
+            d = np.sqrt(np.diag(arr_psd))
+            arr_psd = arr_psd / np.outer(d, d)
+            for i, a1 in enumerate(assets):
+                for j, a2 in enumerate(assets):
+                    matrix[a1][a2] = round(float(arr_psd[i, j]), 3)
 
         return matrix
 

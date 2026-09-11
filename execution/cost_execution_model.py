@@ -15,14 +15,38 @@ import math
 from decimal import Decimal
 from typing import Dict, Any, Optional, Tuple, List
 
+class KrakenOfficialFeeSchedule:
+    """
+    Offizieller Kraken Gebührenplan (Stand 2026).
+    Ermittelt die Gebührenstufe anhand von 30-Tage-Volumen oder Assets on Platform (AoP).
+    """
+    TIERS = [
+        {"name": "Tier 1", "min_vol": 0.0, "min_aop": 0.0, "maker": Decimal("0.0040"), "taker": Decimal("0.0080")},
+        {"name": "Tier 2", "min_vol": 2500.0, "min_aop": 0.0, "maker": Decimal("0.0030"), "taker": Decimal("0.0060")},
+        {"name": "Tier 3", "min_vol": 10000.0, "min_aop": 20000.0, "maker": Decimal("0.0022"), "taker": Decimal("0.0038")},
+        {"name": "Tier 4", "min_vol": 25000.0, "min_aop": 50000.0, "maker": Decimal("0.0020"), "taker": Decimal("0.0035")},
+        {"name": "Tier 5", "min_vol": 50000.0, "min_aop": 100000.0, "maker": Decimal("0.0015"), "taker": Decimal("0.0030")},
+        {"name": "Tier 6", "min_vol": 100000.0, "min_aop": 200000.0, "maker": Decimal("0.0012"), "taker": Decimal("0.0025")},
+    ]
+
+    @classmethod
+    def resolve_fee_tier(cls, vol_30d_usd: float = 0.0, aop_usd: float = 0.0) -> Dict[str, Any]:
+        """Ermittelt die beste zutreffende Gebührenstufe."""
+        best = cls.TIERS[0]
+        for t in cls.TIERS:
+            if vol_30d_usd >= t["min_vol"] or (t["min_aop"] > 0 and aop_usd >= t["min_aop"]):
+                best = t
+        return best
+
+
 class RealisticExecutionModel:
     """
     Simuliert Orderausführungen unter realen Marktbedingungen.
     Verhindert fiktive Gewinne durch Zero-Slippage oder Mid-Price-Fills.
     """
 
-    DEFAULT_TAKER_FEE_PCT = Decimal("0.0026")  # 0.26% Standard Kraken Taker
-    DEFAULT_MAKER_FEE_PCT = Decimal("0.0016")  # 0.16% Standard Kraken Maker
+    DEFAULT_TAKER_FEE_PCT = Decimal("0.0026")  # 0.26% Standard (Tier 5/6)
+    DEFAULT_MAKER_FEE_PCT = Decimal("0.0016")  # 0.16% Standard (Tier 5)
 
     # Typische Kraken Spot Mindestanforderungen
     PAIR_LIMITS = {
@@ -31,6 +55,26 @@ class RealisticExecutionModel:
         "SOLEUR": {"ordermin": 0.01000, "costmin": 0.45, "price_decimals": 2, "vol_decimals": 4},
         "XRPEUR": {"ordermin": 1.00000, "costmin": 0.45, "price_decimals": 4, "vol_decimals": 2},
     }
+
+    @classmethod
+    def verify_trade_expectancy(
+        cls,
+        expected_edge_pct: float,
+        taker_fee_pct: float = 0.0026,
+        is_maker: bool = False,
+        slippage_est_pct: float = 0.0005
+    ) -> Tuple[bool, str]:
+        """
+        Prüft vor Ordererteilung, ob die statistische Kantenrendite
+        die vollen Roundtrip-Kosten übersteigt.
+        """
+        entry_fee = (taker_fee_pct if not is_maker else 0.0016)
+        exit_fee = taker_fee_pct  # Konservativ: Exit erfolgt im Zweifel als Taker (Stop-Loss)
+        total_roundtrip_cost = entry_fee + exit_fee + (2.0 * slippage_est_pct)
+
+        if expected_edge_pct <= total_roundtrip_cost:
+            return False, f"REJECT_NEGATIVE_EXPECTANCY (Edge {expected_edge_pct*100:.2f}% <= Kosten {total_roundtrip_cost*100:.2f}%)"
+        return True, "ACCEPT_POSITIVE_EXPECTANCY"
 
     @classmethod
     def calculate_simulated_fill(
@@ -45,7 +89,8 @@ class RealisticExecutionModel:
         limit_price: Optional[float] = None,
         market_depth_volume: float = 2.0,
         volatility_atr: float = 0.0,
-        latency_ms: float = 120.0
+        latency_ms: float = 120.0,
+        custom_fee_pct: Optional[Decimal] = None
     ) -> Dict[str, Any]:
         """
         Berechnet die realistische Ausführung einer Order gegen Arrival Price.
@@ -53,11 +98,11 @@ class RealisticExecutionModel:
         limits = cls.PAIR_LIMITS.get(pair, {"ordermin": 0.0001, "costmin": 0.5, "price_decimals": 2, "vol_decimals": 6})
         side_upper = side.upper()
 
-        # 1. Mindestorder-Prüfung
+        # 1. Mindestorder-Prüfung (SKIP_MINIMUM_ORDER: Kein künstliches Aufrunden!)
         if requested_volume < limits["ordermin"]:
             return {
                 "filled": False,
-                "reason": "VOLUME_BELOW_MIN",
+                "reason": "SKIP_MINIMUM_ORDER",
                 "filled_volume": 0.0,
                 "exec_price": 0.0,
                 "fee_eur": 0.0,
@@ -68,7 +113,7 @@ class RealisticExecutionModel:
         if nominal_value < limits["costmin"]:
             return {
                 "filled": False,
-                "reason": "COST_BELOW_MIN",
+                "reason": "SKIP_MINIMUM_ORDER",
                 "filled_volume": 0.0,
                 "exec_price": 0.0,
                 "fee_eur": 0.0,
@@ -98,7 +143,7 @@ class RealisticExecutionModel:
 
             exec_price = round(exec_price, limits["price_decimals"])
             filled_vol = requested_volume
-            fee_pct = cls.DEFAULT_TAKER_FEE_PCT
+            fee_pct = custom_fee_pct or cls.DEFAULT_TAKER_FEE_PCT
             fee_eur = round(float(Decimal(str(exec_price)) * Decimal(str(filled_vol)) * fee_pct), 4)
 
             slippage_bps = abs(exec_price - arrival_price) / arrival_price * 10000.0
@@ -147,7 +192,7 @@ class RealisticExecutionModel:
 
             filled_vol = round(requested_volume * fill_ratio, limits["vol_decimals"])
             exec_price = target_limit
-            fee_pct = cls.DEFAULT_MAKER_FEE_PCT
+            fee_pct = custom_fee_pct or cls.DEFAULT_MAKER_FEE_PCT
             fee_eur = round(float(Decimal(str(exec_price)) * Decimal(str(filled_vol)) * fee_pct), 4)
 
             slippage_bps = (arrival_price - exec_price) / arrival_price * 10000.0 if side_upper == "BUY" else (exec_price - arrival_price) / arrival_price * 10000.0

@@ -58,6 +58,8 @@ from stat_arb_kelly_engine import (
 )
 from backtester_engine import QuantitativeBacktester
 from equity_report_generator import HTML5EquityVisualizer
+from ops.config_loader import SystemConfig
+from ops.reconciliation_worker import KrakenReconciliationWorker
 
 HSM_VAULT_PATH = os.path.join(os.getcwd(), ".kraken_hsm_vault.json")
 
@@ -251,6 +253,13 @@ class MultiExchangeTraderApp:
         self.sensitivity_mode = "HYBRID"  # HYBRID / SCALP / MOMENTUM
         self.is_trading_active = True
         self.running = True
+
+        # System Config (config.yaml) & Execution Settings
+        self.system_config = SystemConfig.load()
+        self.post_only_enabled = SystemConfig.is_maker_post_only()
+        self.reconciliation_worker = KrakenReconciliationWorker(db_path="trading_ledger.db", poll_interval_sec=60.0)
+        if self.kraken_api_key and self.kraken_api_secret:
+            self.reconciliation_worker.start_background_worker(self.kraken_api_key, self.kraken_api_secret)
 
         # Core Engines
         self.ws_manager = MultiExchangeWebSocketManager()
@@ -605,19 +614,25 @@ class MultiExchangeTraderApp:
                 messagebox.showwarning("API Keys Fehlen", "Bitte hinterlege erst deine Kraken API Keys im Vault.")
                 return
             confirm = messagebox.askyesno(
-                "🚨 ECHTGELD-HANDEL FREIGEBEN?",
-                "ACHTUNG: Du bist dabei, den vollautonomen LIVE-Modus mit echtem Kraken-Guthaben zu aktivieren!\n\n"
-                "• Es werden echte Marktorders an Kraken übermittelt.\n"
-                "• Echte Gebühren und Marktrisiken fallen an.\n\n"
-                "Möchtest du den Live-Modus wirklich starten?",
+                "🚨 ECHTGELD LIVE-HANDEL STARTEN?",
+                "ACHTUNG: Du aktivierst den VOLLAUTONOMEN LIVE-HANDEL mit deinem echten Kraken-Guthaben!\n\n"
+                "• Echte Orders werden live an Kraken übermittelt.\n"
+                "• Maker Post-Only Schutz (0.40% Gebühr) ist aktiv.\n"
+                "• Zyklische Live-Reconciliation & Circuit Breaker schützen dein Kapital.\n\n"
+                "Möchtest du echte autonome Live-Trades JETZT starten?",
                 icon="warning"
             )
             if not confirm:
                 self.log_console("🛡️ LIVE-Aktivierung vom Nutzer abgebrochen. Bleibe im sicheren PAPER-Modus.")
                 return
             self.trading_mode = "LIVE"
-            self.btn_mode_toggle.config(text="🔴 MODUS: LIVE KRAKEN", bg="#f43f5e")
-            self.log_console("⚠️ UMGESCHALTET AUF LIVE KRAKEN HANDEL (ECHTGELD)!")
+            self.btn_mode_toggle.config(text="🔴 ECHTGELD LIVE: AKTIV (KRAKEN AUTONOM)", bg="#dc2626")
+            self.log_console("⚠️ UMGESCHALTET AUF ECHTGELD LIVE KRAKEN HANDEL!")
+            self.log_console("🚀 AUTONOME LIVE ORDER-PIPELINE MIT MAKER POST-ONLY SCHARFGESCHALTET.")
+            # Sofort Kontostände abrufen
+            self.update_real_balances()
+            if hasattr(self, 'reconciliation_worker') and self.reconciliation_worker:
+                self.reconciliation_worker.start_background_worker(self.kraken_api_key, self.kraken_api_secret)
         else:
             self.trading_mode = "PAPER"
             self.btn_mode_toggle.config(text="🧪 MODUS: PAPER TRADING", bg="#8b5cf6")
@@ -1028,6 +1043,9 @@ class MultiExchangeTraderApp:
                             p_dec = KrakenLiveGateway.PAIR_LIMITS.get(pair_name, {}).get("price_decimals", 1)
                             exec_price = round(order["price"], p_dec)
 
+                            is_risk_exit = (order.get("exit_type") == "RISK_EXIT")
+                            use_post_only = self.post_only_enabled and not is_risk_exit
+
                             live_res = KrakenPrivateWSGateway.execute_sub15ms_order(
                                 self.kraken_api_key,
                                 self.kraken_api_secret,
@@ -1036,7 +1054,8 @@ class MultiExchangeTraderApp:
                                 volume=order["volume"],
                                 price=exec_price,
                                 eur_balance=self.real_balances.get("EUR", 0.0),
-                                asset_balance=self.real_balances.get(asset_code, 0.0)
+                                asset_balance=self.real_balances.get(asset_code, 0.0),
+                                post_only=use_post_only
                             )
                             if live_res.get("status") == "success":
                                 self.last_order_time_per_pair[pair_name] = now_tm

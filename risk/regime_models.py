@@ -1,4 +1,4 @@
-﻿"""
+"""
 REGIME- UND STRUKTURMODELL MIT DATENBASIERTER ÜBERGANGSMATRIX & HYSTERESE
 -------------------------------------------------------------------------
 1. 6 diskrete Regime-Klassen:
@@ -151,6 +151,9 @@ class RollingStressCorrelationMatrix:
 
     def get_correlation_matrix(self):
         return self._engine.get_rolling_correlation_matrix()
+
+    def get_stress_correlation_matrix(self):
+        return self._engine.get_stress_correlation_matrix()
 
     def calculate_stress_var(self, balances_eur: Dict[str, float], confidence: float = 0.99):
         res = self._engine.calculate_portfolio_var_and_es(balances_eur, confidence=confidence)

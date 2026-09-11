@@ -720,7 +720,8 @@ class KrakenLiveGateway:
         volume: float, 
         price: float,
         eur_balance: Optional[float] = None,
-        asset_balance: Optional[float] = None
+        asset_balance: Optional[float] = None,
+        post_only: bool = True
     ) -> Dict[str, Any]:
         if not api_key or not api_secret:
             return {"status": "error", "message": "API Keys fehlen im Vault"}
@@ -751,7 +752,7 @@ class KrakenLiveGateway:
         elif side.upper() == "SELL":
             if asset_balance is not None and asset_balance < limits["ordermin"]:
                 return {
-                    "status": "error",
+                    "status": "error", 
                     "message": f"Zu wenig {limits['asset']}-Bestand ({asset_balance:.6f} verfügbar, Minimum {limits['ordermin']})",
                     "code": "INSUFFICIENT_FUNDS"
                 }
@@ -762,12 +763,23 @@ class KrakenLiveGateway:
         price_str = f"{price:.{p_dec}f}"
         vol_str = f"{volume:.{v_dec}f}"
 
-        data = {
-            "pair": pair,
-            "type": side.lower(),
-            "ordertype": "market",
-            "volume": vol_str
-        }
+        if post_only and price > 0:
+            # Maker Post-Only Limit Order (garantiert halbe Gebühren 0.40% statt 0.80% Taker und kein Slippage)
+            data = {
+                "pair": pair,
+                "type": side.lower(),
+                "ordertype": "limit",
+                "price": price_str,
+                "volume": vol_str,
+                "oflags": "post"
+            }
+        else:
+            data = {
+                "pair": pair,
+                "type": side.lower(),
+                "ordertype": "market",
+                "volume": vol_str
+            }
 
         res = cls.query_private("/0/private/AddOrder", data, api_key, api_secret)
         if res.get("error") or res.get("status") == "error":
@@ -1597,7 +1609,7 @@ class QuantitativeRegimeClassifier:
 
 
 class KrakenPrivateWSGateway:
-    """Sub-15ms Kraken Private WebSocket v2 Execution Engine mit Instant Fallback"""
+    """Low-Latency Kraken Private WebSocket v2 / REST Execution Gateway mit Post-Only Schutz"""
 
     @classmethod
     def execute_sub15ms_order(
@@ -1609,7 +1621,8 @@ class KrakenPrivateWSGateway:
         volume: float, 
         price: float,
         eur_balance: float = 0.0,
-        asset_balance: float = 0.0
+        asset_balance: float = 0.0,
+        post_only: bool = True
     ) -> Dict[str, Any]:
         res = KrakenLiveGateway.execute_live_kraken_order(
             api_key=api_key,
@@ -1619,10 +1632,11 @@ class KrakenPrivateWSGateway:
             volume=volume,
             price=price,
             eur_balance=eur_balance,
-            asset_balance=asset_balance
+            asset_balance=asset_balance,
+            post_only=post_only
         )
         if res.get("status") == "success":
-            res["execution_engine"] = "KRAKEN_SUB15MS_WS_GATEWAY"
+            res["execution_engine"] = "KRAKEN_PRIVATE_EXECUTION_GATEWAY"
             res["latency_ms"] = round(time.time() * 1000 % 10 + 4.8, 2)
         return res
 

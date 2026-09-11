@@ -1,4 +1,4 @@
-﻿"""
+"""
 PORTFOLIO- UND RISIKOMANAGEMENT-ENGINE
 --------------------------------------
 1. Positionsgröße strikt aus Verlustbudget / Stop-Distanz.
@@ -71,10 +71,15 @@ class PortfolioRiskEngine:
         stop_loss_price: float,
         current_asset_exposure_eur: float,
         current_total_exposure_eur: float,
-        current_regime: str = MarketRegime.RANGE_BOUND
+        current_regime: str = MarketRegime.RANGE_BOUND,
+        pending_buy_exposure_eur: float = 0.0,
+        min_order_cost_eur: float = 0.45,
+        min_order_volume: float = 0.00005
     ) -> Dict[str, Any]:
         """
         Berechnet die exakte Positionsgröße basierend auf Stop-Distanz und Verlustbudget.
+        Berücksichtigt offene BUY-Verpflichtungen und verwirft Orders unter Mindestgröße
+        strikt mit SKIP_MINIMUM_ORDER (kein gefährliches Aufrunden!).
         """
         if self.trading_halted:
             return {"allowed": False, "volume": 0.0, "reason": f"HALTED: {self.halt_reason}"}
@@ -95,24 +100,31 @@ class PortfolioRiskEngine:
             risk_per_unit = asset_price * 0.010
             risk_pct = 0.010
 
-        # 3. Maximales Verlustbudget in EUR
+        # 3. Maximales Verlustbudget in EUR (strikt 1.0% der Gesamt-Equity)
         max_loss_budget_eur = current_equity_eur * self.max_risk_per_trade_pct
 
         # Zielvolumen aus Verlustbudget
         target_volume = max_loss_budget_eur / risk_per_unit
         target_cost_eur = target_volume * asset_price
 
-        # 4. Exposure-Limits prüfen
+        # 4. Exposure-Limits prüfen (Pre-Trade Commitment: Offene BUYs zählen bereits voll!)
+        projected_exposure = current_total_exposure_eur + pending_buy_exposure_eur
         max_allowed_total = current_equity_eur * self.max_total_exposure_pct
-        remaining_exposure = max(0.0, max_allowed_total - current_total_exposure_eur)
+        remaining_exposure = max(0.0, max_allowed_total - projected_exposure)
         
-        # Begrenzung auf verfügbares Cash & verbleibendes Exposure
-        allocatable_eur = min(target_cost_eur, current_cash_eur * 0.90, remaining_exposure)
+        # Begrenzung auf verfügbares Cash (nach Abzug offener Kaufverpflichtungen)
+        usable_cash = max(0.0, current_cash_eur - pending_buy_exposure_eur)
+        allocatable_eur = min(target_cost_eur, usable_cash * 0.90, remaining_exposure)
         
-        if allocatable_eur < 1.0: # Unter 1 EUR Allokation macht keinen Sinn
-            return {"allowed": False, "volume": 0.0, "reason": "INSUFFICIENT_EXPOSURE_OR_CASH"}
+        # Kleinkapital-Schutz & Mindestgrößen (SKIP_MINIMUM_ORDER: Niemals aufrunden!)
+        final_volume = allocatable_eur / asset_price if asset_price > 0 else 0.0
 
-        final_volume = allocatable_eur / asset_price
+        if allocatable_eur < min_order_cost_eur or final_volume < min_order_volume:
+            return {
+                "allowed": False,
+                "volume": 0.0,
+                "reason": f"SKIP_MINIMUM_ORDER (Allokation {allocatable_eur:.2f} € < Min {min_order_cost_eur:.2f} € oder Vol {final_volume:.6f} < Min {min_order_volume:.6f})"
+            }
 
         return {
             "allowed": True,

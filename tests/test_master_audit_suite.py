@@ -302,5 +302,104 @@ class MasterAuditTestSuite(unittest.TestCase):
         self.assertEqual(risk_exits[0]["side"], "SELL")
         self.assertEqual(risk_exits[0]["asset"], "BTC")
 
+    # 17. SKIP_MINIMUM_ORDER wenn Order unter Kraken-Mindestgröße liegt (kein künstliches Aufrunden!)
+    def test_17_skip_minimum_order_when_below_kraken_limits(self):
+        risk_engine = PortfolioRiskEngine(max_risk_per_trade_pct=0.01)
+        # Sehr kleines Konto (50 €) mit engem Stop (0.50 € Risiko) -> Zielvolumen sehr gering
+        sizing = risk_engine.calculate_position_size(
+            current_equity_eur=50.0,
+            current_cash_eur=10.0,
+            asset_price=60000.0,
+            stop_loss_price=59500.0,
+            current_asset_exposure_eur=0.0,
+            current_total_exposure_eur=0.0,
+            min_order_cost_eur=0.45,
+            min_order_volume=0.00005  # 0.00005 BTC @ 60000 = 3.00 € Mindestorder
+        )
+        # Risikobudget 1% von 50 € = 0.50 €. Stop-Distanz 500/60000 = 0.833% (unter 1% Min-Distanz -> 1.0% = 600 €)
+        # Target volume = 0.50 / 600 = 0.000833 -> Invest = 50 €
+        # Aber wenn Cash nur 0.30 € ist:
+        sizing_tiny_cash = risk_engine.calculate_position_size(
+            current_equity_eur=50.0,
+            current_cash_eur=0.30,  # Unter 0.45 € Mindestorder
+            asset_price=60000.0,
+            stop_loss_price=58000.0,
+            current_asset_exposure_eur=0.0,
+            current_total_exposure_eur=0.0,
+            min_order_cost_eur=0.45,
+            min_order_volume=0.00005
+        )
+        self.assertFalse(sizing_tiny_cash["allowed"])
+        self.assertIn("SKIP_MINIMUM_ORDER", sizing_tiny_cash["reason"])
+        self.assertEqual(sizing_tiny_cash["volume"], 0.0)
+
+    # 18. REJECT_NEGATIVE_EXPECTANCY blockiert Trades mit statistischem Edge < Roundtrip-Kosten
+    def test_18_reject_negative_expectancy(self):
+        # Edge 0.40% ist kleiner als Roundtrip-Kosten (0.26% Taker + 0.26% Taker + 2*5bps = 0.62%)
+        allowed, reason = RealisticExecutionModel.verify_trade_expectancy(
+            expected_edge_pct=0.0040,
+            taker_fee_pct=0.0026,
+            is_maker=False,
+            slippage_est_pct=0.0005
+        )
+        self.assertFalse(allowed)
+        self.assertIn("REJECT_NEGATIVE_EXPECTANCY", reason)
+
+        # Edge 1.20% übertrifft Roundtrip-Kosten -> Akzeptiert
+        allowed_pos, reason_pos = RealisticExecutionModel.verify_trade_expectancy(
+            expected_edge_pct=0.0120,
+            taker_fee_pct=0.0026,
+            is_maker=False,
+            slippage_est_pct=0.0005
+        )
+        self.assertTrue(allowed_pos)
+        self.assertEqual(reason_pos, "ACCEPT_POSITIVE_EXPECTANCY")
+
+    # 19. PSD-Garantie (Positive Semi-Definite) für die Korrelationsmatrix
+    def test_19_correlation_matrix_psd_guarantee(self):
+        matrix_calc = RollingStressCorrelationMatrix(window=20)
+        engine = matrix_calc._engine
+        p_a, p_b, p_c = 100.0, 50.0, 20.0
+        np.random.seed(42)
+        for _ in range(30):
+            r_a = float(np.random.normal(0, 0.02))
+            r_b = r_a + float(np.random.normal(0, 0.001))
+            r_c = -r_a + float(np.random.normal(0, 0.001))
+            p_a *= (1.0 + r_a)
+            p_b *= (1.0 + r_b)
+            p_c *= (1.0 + r_c)
+            engine.update_price("A", p_a)
+            engine.update_price("B", p_b)
+            engine.update_price("C", p_c)
+
+        stress_mat = engine.get_stress_correlation_matrix()
+        assets = list(stress_mat.keys())
+        self.assertEqual(len(assets), 3)
+        corr_arr = np.array([[stress_mat[a1][a2] for a2 in assets] for a1 in assets])
+
+        # Eigenwerte prüfen: Müssen alle >= 0 sein (PSD-Bedingung)
+        eigenvalues = np.linalg.eigvalsh(corr_arr)
+        for ev in eigenvalues:
+            self.assertGreaterEqual(ev, -1e-6, f"Eigenwert {ev} verletzt PSD-Bedingung")
+
+    # 20. Pre-Trade Commitment schützt vor Überallokation bei gleichzeitigen BUYs
+    def test_20_pre_trade_commitment_accounting(self):
+        risk_engine = PortfolioRiskEngine(max_risk_per_trade_pct=0.02, max_total_exposure_pct=0.50)
+        # Gesamt-Equity 1000 €, Cash 500 €, aber bereits 400 € in offenen BUY-Orders gebunden
+        sizing = risk_engine.calculate_position_size(
+            current_equity_eur=1000.0,
+            current_cash_eur=500.0,
+            asset_price=100.0,
+            stop_loss_price=95.0,  # 5% Stop
+            current_asset_exposure_eur=0.0,
+            current_total_exposure_eur=0.0,
+            pending_buy_exposure_eur=450.0  # 450 € gebunden -> nur noch 50 € Exposure bis 50% Limit frei!
+        )
+        self.assertTrue(sizing["allowed"])
+        # Maximal erlaubte Gesamt-Exposure: 1000 * 0.50 = 500 €
+        # Mit 450 € pending_buy darf die neue Order maximal 50 € groß sein!
+        self.assertLessEqual(sizing["invest_eur"], 50.01)
+
 if __name__ == "__main__":
     unittest.main()
+
