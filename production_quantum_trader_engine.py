@@ -60,6 +60,9 @@ from backtester_engine import QuantitativeBacktester
 from equity_report_generator import HTML5EquityVisualizer
 from ops.config_loader import SystemConfig
 from ops.reconciliation_worker import KrakenReconciliationWorker
+from execution.microstructure import OrderBookMicrostructureAnalyzer
+from execution.tactical_slicer import TacticalOrderSlicer
+from risk.compliance_guard import PreTradeComplianceGuard
 
 HSM_VAULT_PATH = os.path.join(os.getcwd(), ".kraken_hsm_vault.json")
 
@@ -237,9 +240,9 @@ class MultiExchangeTraderApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("⚡ QUBIT QUANT TRADER | AUTONOMOUS HIGH-FREQUENCY ENGINE")
+        self.root.title("CHIMERA-QUBIT // SOVEREIGN AUTONOMOUS TRADING NEXUS")
         self.root.geometry("1600x990+5+5")
-        self.root.configure(bg="#090d16")
+        self.root.configure(bg="#06090e")
         self.root.attributes("-topmost", True)
 
         saved_k, saved_s, saved_tgt, saved_tgc, saved_disc = EncryptedCredentialVault.load_vault()
@@ -260,6 +263,15 @@ class MultiExchangeTraderApp:
         self.reconciliation_worker = KrakenReconciliationWorker(db_path="trading_ledger.db", poll_interval_sec=60.0)
         if self.kraken_api_key and self.kraken_api_secret:
             self.reconciliation_worker.start_background_worker(self.kraken_api_key, self.kraken_api_secret)
+
+        # Chimera Quantitative Execution & Compliance Guard
+        self.compliance_guard = PreTradeComplianceGuard(
+            max_price_deviation_pct=self.system_config.get("risk", {}).get("max_price_collar_pct", 1.5)
+        )
+        self.microstructure_analyzer = OrderBookMicrostructureAnalyzer()
+        self.tactical_slicer = TacticalOrderSlicer(min_slice_value_eur=10.0)
+        self.latest_ofi: float = 0.0
+        self.latest_micro_price: float = 0.0
 
         # Core Engines
         self.ws_manager = MultiExchangeWebSocketManager()
@@ -325,39 +337,73 @@ class MultiExchangeTraderApp:
             self.console.see(tk.END)
 
     def setup_ui(self):
-        # 1. HEADER CONTROL BAR
-        header = tk.Frame(self.root, bg="#111827", height=65, highlightbackground="#1e293b", highlightthickness=1)
-        header.pack(side=tk.TOP, fill=tk.X)
+        # 1. TOP SOVEREIGN COMMAND BAR (CHIMERA STYLED)
+        header = tk.Frame(self.root, bg="#0b111b", height=65, highlightbackground="#1e293b", highlightthickness=1)
+        header.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 4))
 
-        title_frame = tk.Frame(header, bg="#111827")
-        title_frame.pack(side=tk.LEFT, padx=16, pady=10)
+        title_frame = tk.Frame(header, bg="#0b111b")
+        title_frame.pack(side=tk.LEFT, padx=12, pady=8)
+
+        pulse_dot = tk.Label(title_frame, text="●", bg="#0b111b", fg="#22d3ee", font=("Segoe UI", 12))
+        pulse_dot.pack(side=tk.LEFT, padx=(0, 6))
 
         tk.Label(
-            title_frame, text="⚡ QUBIT QUANT TRADER", bg="#111827", fg="#00ff88", font=("Segoe UI", 13, "bold")
-        ).pack(anchor="w")
+            title_frame, text="CHIMERA-QUBIT", bg="#0b111b", fg="#22d3ee", font=("Segoe UI", 13, "bold")
+        ).pack(side=tk.LEFT)
         tk.Label(
-            title_frame, text="Event-Driven Real-Time Spot Engine • Multi-Regime & Risk-Gated Architecture", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8)
-        ).pack(anchor="w")
+            title_frame, text=" // SOVEREIGN AUTONOMOUS TRADING NEXUS", bg="#0b111b", fg="#94a3b8", font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(4, 8))
+
+        self.lbl_nexus_badge = tk.Label(
+            title_frame, text="ACTIVE TRADING ONLINE", bg="#064e3b", fg="#34d399", font=("Segoe UI", 8, "bold"),
+            padx=8, pady=2, relief=tk.SOLID, borderwidth=1
+        )
+        self.lbl_nexus_badge.pack(side=tk.LEFT, padx=6)
+
+        self.lbl_enclave = tk.Label(
+            title_frame, text="ENCLAVE: DPAPI-EPOCH-1 [HARDWARE SEALED]", bg="#0b111b", fg="#64748b", font=("Consolas", 8)
+        )
+        self.lbl_enclave.pack(side=tk.LEFT, padx=6)
 
         # Control Buttons
-        btn_frame = tk.Frame(header, bg="#111827")
-        btn_frame.pack(side=tk.LEFT, padx=15)
+        btn_frame = tk.Frame(header, bg="#0b111b")
+        btn_frame.pack(side=tk.RIGHT, padx=12, pady=8)
 
-        self.btn_mode_toggle = tk.Button(
+        # Kill Switch Button (Red)
+        self.btn_kill = tk.Button(
             btn_frame,
-            text="🧪 MODUS: PAPER TRADING",
-            bg="#8b5cf6",
+            text="🚨 KILL SWITCH",
+            bg="#dc2626",
             fg="#ffffff",
-            activebackground="#7c3aed",
+            activebackground="#b91c1c",
+            activeforeground="#ffffff",
             font=("Segoe UI", 9, "bold"),
             relief=tk.FLAT,
-            command=self.toggle_trading_mode,
+            command=self.trigger_kill_switch,
             cursor="hand2",
             padx=12,
             pady=4
         )
-        self.btn_mode_toggle.pack(side=tk.LEFT, padx=5)
+        self.btn_kill.pack(side=tk.RIGHT, padx=4)
 
+        # Resume Button (Emerald)
+        self.btn_resume = tk.Button(
+            btn_frame,
+            text="▶ RESUME",
+            bg="#065f46",
+            fg="#34d399",
+            activebackground="#047857",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.resume_operations,
+            cursor="hand2",
+            padx=10,
+            pady=4
+        )
+        self.btn_resume.pack(side=tk.RIGHT, padx=4)
+
+        # Regime / Sensitivity Mode Toggle
         self.btn_sens_toggle = tk.Button(
             btn_frame,
             text="⚡ MODUS: HYBRID AUTONOMOUS",
@@ -368,117 +414,184 @@ class MultiExchangeTraderApp:
             relief=tk.FLAT,
             command=self.toggle_sensitivity_mode,
             cursor="hand2",
-            padx=12,
+            padx=10,
             pady=4
         )
-        self.btn_sens_toggle.pack(side=tk.LEFT, padx=5)
+        self.btn_sens_toggle.pack(side=tk.RIGHT, padx=4)
 
-        btn_manual_trade = tk.Button(
+        # Vault Button
+        btn_vault = tk.Button(
             btn_frame,
-            text="🚀 Test-Order Ausführen",
-            bg="#334155",
-            fg="#f1f5f9",
-            activebackground="#475569",
-            font=("Segoe UI", 9),
+            text="🔐 KRAKEN VAULT",
+            bg="#1e293b",
+            fg="#38bdf8",
+            activebackground="#334155",
+            font=("Segoe UI", 9, "bold"),
             relief=tk.FLAT,
-            command=self.trigger_manual_test_trade,
+            command=self.open_vault_dialog,
             cursor="hand2",
             padx=10,
             pady=4
         )
-        btn_manual_trade.pack(side=tk.LEFT, padx=5)
+        btn_vault.pack(side=tk.RIGHT, padx=4)
 
-        # Right Header Badges
-        right_hdr = tk.Frame(header, bg="#111827")
-        right_hdr.pack(side=tk.RIGHT, padx=16)
+        # Mode Toggle (Paper / Live)
+        self.btn_mode_toggle = tk.Button(
+            btn_frame,
+            text="🧪 MODUS: PAPER TRADING",
+            bg="#7c3aed",
+            fg="#ffffff",
+            activebackground="#6d28d9",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.toggle_trading_mode,
+            cursor="hand2",
+            padx=12,
+            pady=4
+        )
+        self.btn_mode_toggle.pack(side=tk.RIGHT, padx=4)
 
+        # HTML5 Report
         btn_report = tk.Button(
-            right_hdr, text="📊 HTML5 Report", bg="#1e293b", fg="#00ff88", font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT, command=lambda: HTML5EquityVisualizer.open_report_in_browser(), cursor="hand2", padx=10, pady=4
+            btn_frame,
+            text="📊 HTML5",
+            bg="#1e293b",
+            fg="#22d3ee",
+            activebackground="#334155",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=lambda: HTML5EquityVisualizer.open_report_in_browser(),
+            cursor="hand2",
+            padx=8,
+            pady=4
         )
-        btn_report.pack(side=tk.RIGHT, padx=6)
+        btn_report.pack(side=tk.RIGHT, padx=4)
 
-        btn_vault = tk.Button(
-            right_hdr, text="🔐 API Key Vault", bg="#1e293b", fg="#38bdf8", font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT, command=self.open_vault_dialog, cursor="hand2", padx=10, pady=4
+        # Manual Test Order
+        btn_manual_trade = tk.Button(
+            btn_frame,
+            text="🚀 TEST ORDER",
+            bg="#334155",
+            fg="#f1f5f9",
+            activebackground="#475569",
+            font=("Segoe UI", 8),
+            relief=tk.FLAT,
+            command=self.trigger_manual_test_trade,
+            cursor="hand2",
+            padx=8,
+            pady=4
         )
-        btn_vault.pack(side=tk.RIGHT, padx=6)
+        btn_manual_trade.pack(side=tk.RIGHT, padx=4)
 
-        self.lbl_profit_guard = tk.Label(
-            right_hdr, text="🛡️ 100% PROFIT-GUARD: AKTIV", bg="#1e1b4b", fg="#c084fc", font=("Segoe UI", 8, "bold"),
-            padx=10, pady=4
+        # 2. HERO KPI GRID (5 CHIMERA CARDS)
+        hero_bar = tk.Frame(self.root, bg="#06090e")
+        hero_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=4)
+
+        # Card 1: TOTAL REAL CASH BALANCE
+        card1 = tk.Frame(hero_bar, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        card1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+        tk.Label(card1, text="TOTAL REAL CASH BALANCE", bg="#0b111b", fg="#64748b", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(6, 1))
+        self.lbl_equity = tk.Label(card1, text="Lade echten Kontostand...", bg="#0b111b", fg="#ffffff", font=("Consolas", 14, "bold"))
+        self.lbl_equity.pack(anchor="w", padx=10)
+        self.lbl_equity_sub = tk.Label(card1, text="Sovereign Treasury Vault (Kraken)", bg="#0b111b", fg="#06b6d4", font=("Segoe UI", 7))
+        self.lbl_equity_sub.pack(anchor="w", padx=10, pady=(1, 6))
+
+        # Card 2: REALIZED FIFO NET ALPHA PnL
+        card2 = tk.Frame(hero_bar, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        card2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+        tk.Label(card2, text="REALIZED FIFO NET ALPHA PnL", bg="#0b111b", fg="#64748b", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(6, 1))
+        self.lbl_cum_pnl_card = tk.Label(card2, text="+€0.00", bg="#0b111b", fg="#10b981", font=("Consolas", 14, "bold"))
+        self.lbl_cum_pnl_card.pack(anchor="w", padx=10)
+        self.lbl_pnl_accrual = tk.Label(card2, text="+0.00% Alpha Accrual", bg="#0b111b", fg="#34d399", font=("Segoe UI", 7))
+        self.lbl_pnl_accrual.pack(anchor="w", padx=10, pady=(1, 6))
+
+        # Card 3: HYDRA L2 MICRO-PRICE & OFI
+        card3 = tk.Frame(hero_bar, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        card3.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+        tk.Label(card3, text="HYDRA L2 MICRO-PRICE & OFI", bg="#0b111b", fg="#64748b", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(6, 1))
+        self.lbl_micro_ofi = tk.Label(card3, text="OFI: +0.00 | P_micro: --", bg="#0b111b", fg="#38bdf8", font=("Consolas", 13, "bold"))
+        self.lbl_micro_ofi.pack(anchor="w", padx=10)
+        self.lbl_micro_ofi_sub = tk.Label(card3, text="Multi-Level L2 Depth & OFI Guard", bg="#0b111b", fg="#64748b", font=("Segoe UI", 7))
+        self.lbl_micro_ofi_sub.pack(anchor="w", padx=10, pady=(1, 6))
+
+        # Card 4: JUSTITIA PRE-TRADE COMPLIANCE
+        card4 = tk.Frame(hero_bar, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        card4.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+        tk.Label(card4, text="JUSTITIA PRE-TRADE COMPLIANCE", bg="#0b111b", fg="#64748b", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(6, 1))
+        self.lbl_compliance_rate = tk.Label(card4, text="100.0% PASS RATE", bg="#0b111b", fg="#10b981", font=("Consolas", 14, "bold"))
+        self.lbl_compliance_rate.pack(anchor="w", padx=10)
+        self.lbl_compliance_sub = tk.Label(card4, text="Price Collar ±1.5% • Fat-Finger Guard", bg="#0b111b", fg="#64748b", font=("Segoe UI", 7))
+        self.lbl_compliance_sub.pack(anchor="w", padx=10, pady=(1, 6))
+
+        # Card 5: CRYPTOGRAPHIC MERKLE HEIGHT
+        card5 = tk.Frame(hero_bar, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        card5.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+        tk.Label(card5, text="CRYPTOGRAPHIC MERKLE HEIGHT", bg="#0b111b", fg="#64748b", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(6, 1))
+        self.lbl_merkle_height = tk.Label(card5, text="Block #0", bg="#0b111b", fg="#22d3ee", font=("Consolas", 14, "bold"))
+        self.lbl_merkle_height.pack(anchor="w", padx=10)
+        self.lbl_merkle_root = tk.Label(card5, text="SHA-256 Root: e3b0c442...", bg="#0b111b", fg="#64748b", font=("Consolas", 7))
+        self.lbl_merkle_root.pack(anchor="w", padx=10, pady=(1, 6))
+
+        # 3. OPERATIONAL STRIP (WALLETS, REGIME, POST-ONLY STATUS)
+        info_strip = tk.Frame(self.root, bg="#070c14", highlightbackground="#1e293b", highlightthickness=1)
+        info_strip.pack(side=tk.TOP, fill=tk.X, padx=8, pady=2)
+
+        self.lbl_wallets_detail = tk.Label(
+            info_strip, text="💼 ALLOKIERTE BESTÄNDE: BTC: 0.00 | XRP: 0.00 | ETH: 0.00 | SOL: 0.00 | Cash: 0.00 €",
+            bg="#070c14", fg="#38bdf8", font=("Consolas", 9, "bold")
         )
-        self.lbl_profit_guard.pack(side=tk.RIGHT, padx=5)
+        self.lbl_wallets_detail.pack(side=tk.LEFT, padx=10, pady=3)
+        self.lbl_wallets_sub = tk.Label(info_strip, text="", bg="#070c14")
 
         self.lbl_feed_status = tk.Label(
-            right_hdr, text="🟢 KRAKEN API & PRIVATE WS AKTIV", bg="#064e3b", fg="#34d399", font=("Segoe UI", 8, "bold"),
-            padx=10, pady=4
+            info_strip, text="🟢 KRAKEN API & WS AKTIV", bg="#064e3b", fg="#34d399", font=("Segoe UI", 8, "bold"),
+            padx=8, pady=2
         )
-        self.lbl_feed_status.pack(side=tk.RIGHT, padx=5)
+        self.lbl_feed_status.pack(side=tk.RIGHT, padx=8, pady=3)
 
-        # 2. HERO KPI CARDS (3 Hauptkarten)
-        hero_bar = tk.Frame(self.root, bg="#090d16")
-        hero_bar.pack(side=tk.TOP, fill=tk.X, padx=12, pady=6)
+        self.lbl_profit_guard = tk.Label(
+            info_strip, text="🛡️ MAKER POST-ONLY: 0.40% TARIFF", bg="#1e1b4b", fg="#c084fc", font=("Segoe UI", 8, "bold"),
+            padx=8, pady=2
+        )
+        self.lbl_profit_guard.pack(side=tk.RIGHT, padx=6, pady=3)
 
-        # Card 1: Gesamtkontostand
-        card1 = tk.Frame(hero_bar, bg="#151c2c", highlightbackground="#232f48", highlightthickness=1)
-        card1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
-        tk.Label(card1, text="💰 GESAMTKONTOSTAND (ECHTES GUTHABEN):", bg="#151c2c", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
-        self.lbl_equity = tk.Label(card1, text="Lade echten Kraken Kontostand...", bg="#151c2c", fg="#00ff88", font=("Consolas", 17, "bold"))
-        self.lbl_equity.pack(anchor="w", padx=12)
-        self.lbl_equity_sub = tk.Label(card1, text="100% Wallet-Kapital-Allokation aktiv • Cash-Puffer geschützt", bg="#151c2c", fg="#64748b", font=("Segoe UI", 8))
-        self.lbl_equity_sub.pack(anchor="w", padx=12, pady=(1, 8))
+        self.lbl_regime_badge = tk.Label(
+            info_strip, text="🧠 REGIME: RANGE_SCALPING (65%)", bg="#070c14", fg="#fbbf24", font=("Consolas", 9, "bold")
+        )
+        self.lbl_regime_badge.pack(side=tk.RIGHT, padx=10, pady=3)
+        self.lbl_regime_sub = tk.Label(info_strip, text="", bg="#070c14")
 
-        # Card 2: Wallet-Bestände
-        card2 = tk.Frame(hero_bar, bg="#151c2c", highlightbackground="#232f48", highlightthickness=1)
-        card2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
-        tk.Label(card2, text="💼 ALLOKIERTE WALLET-BESTÄNDE:", bg="#151c2c", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
-        self.lbl_wallets_detail = tk.Label(card2, text="BTC: 0.00 | XRP: 0.00 | SOL: 0.00 | EUR: 0.00 €", bg="#151c2c", fg="#38bdf8", font=("Consolas", 12, "bold"))
-        self.lbl_wallets_detail.pack(anchor="w", padx=12)
-        self.lbl_wallets_sub = tk.Label(card2, text="Priorisiertes Rebalancing nach Composite Edge Score", bg="#151c2c", fg="#64748b", font=("Segoe UI", 8))
-        self.lbl_wallets_sub.pack(anchor="w", padx=12, pady=(1, 8))
+        # 4. 4-EXCHANGE TICKER & ORDERBOOK FLOW BAR
+        ex_frame = tk.Frame(self.root, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        ex_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=2)
 
-        # Card 3: AI Regime & Risiko-Radar
-        card3 = tk.Frame(hero_bar, bg="#151c2c", highlightbackground="#232f48", highlightthickness=1)
-        card3.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
-        tk.Label(card3, text="🧠 AI MARKTREGIME & RISIKO-RADAR:", bg="#151c2c", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
-        self.lbl_regime_badge = tk.Label(card3, text="RANGE_SCALPING (Effizienz: 65%)", bg="#151c2c", fg="#fbbf24", font=("Consolas", 12, "bold"))
-        self.lbl_regime_badge.pack(anchor="w", padx=12)
-        self.lbl_regime_sub = tk.Label(card3, text="Circuit Breaker: 5.0% Max Drawdown • Vola-Adaptiver Stop-Loss", bg="#151c2c", fg="#64748b", font=("Segoe UI", 8))
-        self.lbl_regime_sub.pack(anchor="w", padx=12, pady=(1, 8))
+        tk.Label(ex_frame, text="🌐 LIVE MULTI-VENUE FEEDS & WEBSOCKET-LATENZEN:", bg="#0b111b", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(3, 1))
 
-        # 3. 4-EXCHANGE TICKER & ORDERBOOK FLOW BAR
-        ex_frame = tk.Frame(self.root, bg="#111827", highlightbackground="#1e293b", highlightthickness=1)
-        ex_frame.pack(side=tk.TOP, fill=tk.X, padx=16, pady=4)
-
-        tk.Label(ex_frame, text="🌐 LIVE BÖRSEN-FEEDS & WEBSOCKET-LATENZEN:", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(3, 1))
-
-        ex_inner = tk.Frame(ex_frame, bg="#111827")
+        ex_inner = tk.Frame(ex_frame, bg="#0b111b")
         ex_inner.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
 
         self.ex_labels = {}
         for ex in ["Kraken", "Binance", "Coinbase", "Bybit"]:
-            c = tk.Frame(ex_inner, bg="#151c2c", highlightbackground="#232f48", highlightthickness=1)
+            c = tk.Frame(ex_inner, bg="#070c14", highlightbackground="#1e293b", highlightthickness=1)
             c.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3, pady=2)
-            tk.Label(c, text=f"🏛️ {ex}", bg="#151c2c", fg="#38bdf8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(2, 0))
-            lbl = tk.Label(c, text="Lade Feed...", bg="#151c2c", fg="#00ff88", font=("Consolas", 9, "bold"))
+            tk.Label(c, text=f"🏛️ {ex}", bg="#070c14", fg="#38bdf8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(2, 0))
+            lbl = tk.Label(c, text="Lade Feed...", bg="#070c14", fg="#10b981", font=("Consolas", 9, "bold"))
             lbl.pack(anchor="w", padx=6, pady=(0, 2))
             self.ex_labels[ex] = lbl
 
-        # Extra Flow Card: Binance Lead-Lag & CVD
-        c_flow = tk.Frame(ex_inner, bg="#151c2c", highlightbackground="#232f48", highlightthickness=1)
+        c_flow = tk.Frame(ex_inner, bg="#070c14", highlightbackground="#1e293b", highlightthickness=1)
         c_flow.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3, pady=2)
-        tk.Label(c_flow, text="📡 LEAD-LAG & CVD RADAR", bg="#151c2c", fg="#a855f7", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(2, 0))
-        self.lbl_flow_radar = tk.Label(c_flow, text="CVD: NEUTRAL | LEAD: NORMAL", bg="#151c2c", fg="#fbbf24", font=("Consolas", 9, "bold"))
+        tk.Label(c_flow, text="📡 LEAD-LAG & CVD RADAR", bg="#070c14", fg="#a855f7", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(2, 0))
+        self.lbl_flow_radar = tk.Label(c_flow, text="CVD: NEUTRAL | LEAD: NORMAL", bg="#070c14", fg="#fbbf24", font=("Consolas", 9, "bold"))
         self.lbl_flow_radar.pack(anchor="w", padx=6, pady=(0, 2))
 
-        # 4. MATH EDGES & QUANTITATIVE SIGNALS
-        edge_frame = tk.Frame(self.root, bg="#111827", highlightbackground="#1e293b", highlightthickness=1)
-        edge_frame.pack(side=tk.TOP, fill=tk.X, padx=16, pady=4)
+        # 5. MATH EDGES & QUANTITATIVE SIGNALS
+        edge_frame = tk.Frame(self.root, bg="#0b111b", highlightbackground="#1e293b", highlightthickness=1)
+        edge_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=2)
 
-        tk.Label(edge_frame, text="📊 QUANTITATIVE MATHEMATISCHE EDGES (LIVE KERN-METRIKEN):", bg="#111827", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(3, 1))
+        tk.Label(edge_frame, text="📊 QUANTITATIVE MATHEMATISCHE EDGES (LIVE KERN-METRIKEN):", bg="#0b111b", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(3, 1))
 
-        edge_inner = tk.Frame(edge_frame, bg="#111827")
+        edge_inner = tk.Frame(edge_frame, bg="#0b111b")
         edge_inner.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
 
         self.edge_labels = {}
@@ -489,45 +602,45 @@ class MultiExchangeTraderApp:
             ("⚖️ Kraken OBI Index", "obi"),
             ("⚡ Composite Execution Signal", "signal")
         ]:
-            card = tk.Frame(edge_inner, bg="#151c2c", highlightbackground="#232f48", highlightthickness=1)
+            card = tk.Frame(edge_inner, bg="#070c14", highlightbackground="#1e293b", highlightthickness=1)
             card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3, pady=2)
 
-            tk.Label(card, text=title, bg="#151c2c", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(2, 0))
-            lbl = tk.Label(card, text="--", bg="#151c2c", fg="#00ff88", font=("Consolas", 9, "bold"))
+            tk.Label(card, text=title, bg="#070c14", fg="#94a3b8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(2, 0))
+            lbl = tk.Label(card, text="--", bg="#070c14", fg="#10b981", font=("Consolas", 9, "bold"))
             lbl.pack(anchor="w", padx=6, pady=(0, 2))
             self.edge_labels[key] = lbl
 
-        # 5. TRADE LEDGER TABLE (Styling mit ttk.Style)
-        main_frame = tk.Frame(self.root, bg="#090d16")
-        main_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=4)
+        # 6. TRADE LEDGER TABLE
+        main_frame = tk.Frame(self.root, bg="#06090e")
+        main_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=2)
 
-        ledger_hdr = tk.Frame(main_frame, bg="#090d16")
-        ledger_hdr.pack(side=tk.TOP, fill=tk.X, pady=(2, 4))
-        tk.Label(ledger_hdr, text="📜 HANDELSJOURNAL (PERSISTENTE ECHTE KRAKEN ORDERS & REBALANCING):", bg="#090d16", fg="#f1f5f9", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
-        self.lbl_cum_pnl = tk.Label(ledger_hdr, text="Gesamt Realisierte PnL: +0.00 €", bg="#090d16", fg="#00ff88", font=("Segoe UI", 9, "bold"))
+        ledger_hdr = tk.Frame(main_frame, bg="#06090e")
+        ledger_hdr.pack(side=tk.TOP, fill=tk.X, pady=(2, 3))
+        tk.Label(ledger_hdr, text="📜 HANDELSJOURNAL (PERSISTENTE ECHTE KRAKEN ORDERS & REBALANCING):", bg="#06090e", fg="#f1f5f9", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        self.lbl_cum_pnl = tk.Label(ledger_hdr, text="Gesamt Realisierte PnL: +0.00 €", bg="#06090e", fg="#10b981", font=("Segoe UI", 9, "bold"))
         self.lbl_cum_pnl.pack(side=tk.RIGHT)
 
         style = ttk.Style()
         style.theme_use("clam")
         style.configure(
             "Treeview",
-            background="#111827",
-            foreground="#f1f5f9",
-            fieldbackground="#111827",
-            rowheight=26,
+            background="#070c14",
+            foreground="#d1d5db",
+            fieldbackground="#070c14",
+            rowheight=24,
             font=("Consolas", 9)
         )
         style.configure(
             "Treeview.Heading",
-            background="#1e293b",
-            foreground="#38bdf8",
+            background="#0b111b",
+            foreground="#22d3ee",
             font=("Segoe UI", 9, "bold"),
             relief="flat"
         )
-        style.map("Treeview", background=[("selected", "#1e293b")], foreground=[("selected", "#00ff88")])
+        style.map("Treeview", background=[("selected", "#1e293b")], foreground=[("selected", "#22d3ee")])
 
         columns = ("time", "side", "price", "volume", "fee", "pnl", "status")
-        self.trade_tree = ttk.Treeview(main_frame, columns=columns, show="headings", height=8)
+        self.trade_tree = ttk.Treeview(main_frame, columns=columns, show="headings", height=7)
 
         self.trade_tree.heading("time", text="Zeitstempel")
         self.trade_tree.heading("side", text="Order-Typ")
@@ -537,20 +650,19 @@ class MultiExchangeTraderApp:
         self.trade_tree.heading("pnl", text="Netto-PnL (€)")
         self.trade_tree.heading("status", text="Ausführungs-Status & TXID")
 
-        self.trade_tree.column("time", width=110, anchor="center")
-        self.trade_tree.column("side", width=90, anchor="center")
-        self.trade_tree.column("price", width=130, anchor="center")
-        self.trade_tree.column("volume", width=130, anchor="center")
-        self.trade_tree.column("fee", width=110, anchor="center")
-        self.trade_tree.column("pnl", width=120, anchor="center")
-        self.trade_tree.column("status", width=240, anchor="w")
+        self.trade_tree.column("time", width=100, anchor="center")
+        self.trade_tree.column("side", width=80, anchor="center")
+        self.trade_tree.column("price", width=120, anchor="center")
+        self.trade_tree.column("volume", width=120, anchor="center")
+        self.trade_tree.column("fee", width=100, anchor="center")
+        self.trade_tree.column("pnl", width=110, anchor="center")
+        self.trade_tree.column("status", width=250, anchor="w")
 
-        self.trade_tree.tag_configure("BUY", foreground="#00ff88")
+        self.trade_tree.tag_configure("BUY", foreground="#10b981")
         self.trade_tree.tag_configure("SELL", foreground="#f43f5e")
 
         self.trade_tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=1)
 
-        # Lade historische Trades aus der SQLite-Datenbank
         past_trades = self.db_manager.fetch_all_trades()
         for t in reversed(past_trades):
             side = t.get("side", "BUY")
@@ -561,10 +673,34 @@ class MultiExchangeTraderApp:
                 tags=(tag,)
             )
 
-        # 6. LIVE CONSOLE TERMINAL
-        self.console = tk.Text(main_frame, bg="#0b0f19", fg="#00ff88", font=("Consolas", 8), height=5, relief=tk.FLAT, highlightbackground="#1e293b", highlightthickness=1)
-        self.console.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, pady=(4, 2))
-        self.log_console("⚡ QUBIT QUANT TRADER INITIALISIERT! Standard-Sicherheitsmodus: PAPER TRADING aktiv.")
+        # 7. LIVE CONSOLE TERMINAL
+        self.console = tk.Text(main_frame, bg="#070c14", fg="#34d399", font=("Consolas", 8), height=5, relief=tk.FLAT, highlightbackground="#1e293b", highlightthickness=1)
+        self.console.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, pady=(3, 1))
+        self.log_console("⚡ CHIMERA-QUBIT INITIALISIERT! Standard-Sicherheitsmodus: PAPER TRADING aktiv.")
+
+    def trigger_kill_switch(self):
+        self.is_trading_active = False
+        self.log_console("🚨 SOVEREIGN KILL SWITCH AKTIVIERT: Handelsausführung sofort gestoppt!")
+        if self.trading_mode == "LIVE" and self.kraken_api_key and self.kraken_api_secret:
+            res = KrakenLiveGateway.cancel_stale_orders(self.kraken_api_key, self.kraken_api_secret, allowed_txids=self.bot_txids)
+            self.log_console(f"🛑 KILL SWITCH: {res.get('canceled_count', 0)} aktive Kraken-Orders storniert.")
+        self.lbl_feed_status.config(text="🚨 KILL SWITCH AKTIV (HALTED)", bg="#7f1d1d", fg="#fca5a5")
+        messagebox.showwarning("🚨 KILL SWITCH", "Der Sovereign Kill Switch wurde ausgelöst!\nAlle Handelsaktivitäten wurden gestoppt und offene Bot-Orders storniert.")
+
+    def resume_operations(self):
+        self.is_trading_active = True
+        self.lbl_feed_status.config(text="🟢 KRAKEN API & WS AKTIV", bg="#064e3b", fg="#34d399")
+        self.log_console("▶ HANDELSOPERATIONEN WIEDERAUFGENOMMEN: Autonome Pipeline aktiv.")
+
+    def update_real_balances(self):
+        if self.kraken_api_key and self.kraken_api_secret:
+            bals = KrakenLiveGateway.fetch_real_balances(self.kraken_api_key, self.kraken_api_secret)
+            if "error" not in bals:
+                self.real_balances = bals
+                live_prices = self.ws_manager.asset_prices
+                eq = KrakenLiveGateway.calculate_total_equity_eur(bals, live_prices)
+                self.real_equity_eur = eq
+                self.root.after(0, lambda e=eq, b=bals: self._update_balances_ui(e, b))
 
     def start_balance_fetch_loop(self):
         def loop():
@@ -899,6 +1035,14 @@ class MultiExchangeTraderApp:
 
                 cvd_data = cvd_dict.get("BTC", {})
 
+                # Microstructure & OFI Analyse (Hydra L2)
+                k_ob = self.ws_manager.orderbooks.get("Kraken", {})
+                kraken_bids = k_ob.get("bids", [])
+                kraken_asks = k_ob.get("asks", [])
+                self.latest_ofi, self.latest_micro_price = self.microstructure_analyzer.compute_order_book_microstructure(
+                    kraken_bids, kraken_asks
+                )
+
                 # VALIDIERTE STRATEGIE-ENGINE: HYPOTHESE H2 (MEAN-REVERSION NACH ERSCHÖPFUNG)
                 # Kauft nur bei statistischer Extrem-Auslenkung (> 2.0 StdAbw vom Mittelwert)
                 # UND bestätigtem OBI/Käuferdruck (kein blindes Hineingreifen in freie Abstürze).
@@ -1031,6 +1175,24 @@ class MultiExchangeTraderApp:
                                 self.log_console(f"🛡️ {corr_msg}")
                                 continue
 
+                        # Hydra L2 OFI Falling-Knife Veto
+                        if order["side"] == "BUY" and self.microstructure_analyzer.is_knife_falling(kraken_bids, kraken_asks, ofi_threshold=-0.40):
+                            self.log_console(f"🔪 HYDRA L2 OFI VETO ({pair_name}): Negativer Orderfluss (OFI: {self.latest_ofi:+.2f}) – Absturzrisiko blockiert!")
+                            continue
+
+                        # Justitia Pre-Trade Compliance Guard (Price Collar & Limits)
+                        ref_p = kraken_p if kraken_p > 0 else order["price"]
+                        comp_eval = self.compliance_guard.validate_order(
+                            pair=pair_name,
+                            side=order["side"],
+                            volume=order["volume"],
+                            price=order["price"],
+                            reference_price=ref_p
+                        )
+                        if not comp_eval["allowed"]:
+                            self.log_console(f"🛡️ JUSTITIA COMPLIANCE VETO ({pair_name}): {comp_eval['reason']}")
+                            continue
+
                         intent = OrderLifecycleTracker.create_intent(
                             pair=pair_name,
                             side=order["side"],
@@ -1088,6 +1250,16 @@ class MultiExchangeTraderApp:
                                     txid=txid,
                                     filled_vol=actual_vol,
                                     fee_eur=actual_fee
+                                )
+
+                                # Cryptographic Merkle Hash Audit Trail
+                                self.compliance_guard.record_executed_trade(
+                                    pair=pair_name,
+                                    side=live_res["side"],
+                                    volume=actual_vol,
+                                    price=actual_price,
+                                    fee_eur=actual_fee,
+                                    txid=txid
                                 )
 
                                 pnl_eur = 0.0
@@ -1204,6 +1376,14 @@ class MultiExchangeTraderApp:
                                     filled_vol=paper_rec["volume"],
                                     fee_eur=paper_rec["fee_eur"]
                                 )
+                                self.compliance_guard.record_executed_trade(
+                                    pair=pair_name,
+                                    side=paper_rec["side"],
+                                    volume=paper_rec["volume"],
+                                    price=paper_rec["price"],
+                                    fee_eur=paper_rec["fee_eur"],
+                                    txid="PAPER-SIM"
+                                )
                                 self.root.after(0, lambda r=paper_rec: self.add_trade_to_ledger(r))
                                 self.log_console(f"🧪 PAPER TRADE AUSGEFÜHRT: {paper_rec['side']} {paper_rec['volume']:.6f} {asset_code} @ {paper_rec['price']:.2f} € (PnL: {paper_rec['pnl_eur']:+.2f} €)")
 
@@ -1219,7 +1399,9 @@ class MultiExchangeTraderApp:
                     "regime_conf": regime_res.get("confidence", 0.5),
                     "lead_lag": lead_lag,
                     "cvd": cvd_data,
-                    "cum_pnl": self.db_manager.fetch_cumulative_pnl()
+                    "cum_pnl": self.db_manager.fetch_cumulative_pnl(),
+                    "ofi": self.latest_ofi,
+                    "micro_p": self.latest_micro_price
                 }
                 self.root.after(0, lambda d=ui_info: self.update_dashboard(d))
                 time.sleep(1.5)
@@ -1236,8 +1418,37 @@ class MultiExchangeTraderApp:
             lat = data["latency_ms"]
             self.ex_labels[ex].config(
                 text=f"{p:,.2f} USD ({lat:.1f}ms)" if p > 0 else "Warte auf WS...",
-                fg="#00ff88" if p > 0 else "#fbbf24"
+                fg="#10b981" if p > 0 else "#fbbf24"
             )
+
+        # Hero Card 2: PnL & Accrual
+        pnl = d.get("cum_pnl", 0.0)
+        pnl_color = "#10b981" if pnl >= 0 else "#f43f5e"
+        self.lbl_cum_pnl_card.config(text=f"{pnl:+.2f} €", fg=pnl_color)
+        self.lbl_cum_pnl.config(text=f"Gesamt Realisierte PnL: {pnl:+.2f} €", fg=pnl_color)
+        eq_base = max(self.real_equity_eur, 50.0)
+        pnl_pct = (pnl / eq_base * 100.0) if eq_base > 0 else 0.0
+        self.lbl_pnl_accrual.config(text=f"{pnl_pct:+.2f}% Alpha Accrual", fg=pnl_color)
+
+        # Hero Card 3: Hydra L2 Micro-Price & OFI
+        ofi_v = d.get("ofi", 0.0)
+        micro_p = d.get("micro_p", 0.0)
+        ofi_col = "#10b981" if ofi_v > 0.05 else "#f43f5e" if ofi_v < -0.05 else "#38bdf8"
+        self.lbl_micro_ofi.config(
+            text=f"OFI: {ofi_v:+.2f} | P_mic: {micro_p:,.1f}" if micro_p > 0 else f"OFI: {ofi_v:+.2f} | P_mic: --",
+            fg=ofi_col
+        )
+
+        # Hero Card 4: Justitia Compliance Pass Rate
+        total_c = self.compliance_guard.order_count
+        pass_pct = (1.0 - (self.compliance_guard.rejection_count / total_c)) * 100.0 if total_c > 0 else 100.0
+        self.lbl_compliance_rate.config(text=f"{pass_pct:.1f}% PASS RATE")
+
+        # Hero Card 5: Cryptographic Merkle Height
+        m_height = len(self.compliance_guard.merkle_leaves)
+        m_root = self.compliance_guard.get_merkle_root()[:12]
+        self.lbl_merkle_height.config(text=f"Block #{m_height}")
+        self.lbl_merkle_root.config(text=f"SHA-256 Root: {m_root}...")
 
         # Radar Flow Card
         cvd_info = d.get("cvd", {})
@@ -1249,23 +1460,18 @@ class MultiExchangeTraderApp:
         # Regime Badge Card
         reg = d.get("regime", "RANGE_SCALPING")
         conf = d.get("regime_conf", 0.5)
-        reg_color = "#00ff88" if "BULL" in reg else "#f43f5e" if "BEAR" in reg else "#fbbf24"
-        self.lbl_regime_badge.config(text=f"{reg} ({conf*100:.0f}%)", fg=reg_color)
-
-        # Cumulative PnL
-        pnl = d.get("cum_pnl", 0.0)
-        pnl_color = "#00ff88" if pnl >= 0 else "#f43f5e"
-        self.lbl_cum_pnl.config(text=f"Gesamt Realisierte PnL: {pnl:+.2f} €", fg=pnl_color)
+        reg_color = "#10b981" if "BULL" in reg else "#f43f5e" if "BEAR" in reg else "#fbbf24"
+        self.lbl_regime_badge.config(text=f"🧠 REGIME: {reg} ({conf*100:.0f}%)", fg=reg_color)
 
         self.edge_labels["rsi"].config(text=f"{d['rsi']:.1f}")
         z = d["zscore"]
-        z_color = "#00ff88" if z <= -1.0 else "#f43f5e" if z >= 1.0 else "#f1f5f9"
+        z_color = "#10b981" if z <= -1.0 else "#f43f5e" if z >= 1.0 else "#f1f5f9"
         self.edge_labels["zscore"].config(text=f"{z:+.2f} {'(Underpriced)' if z <= -1.0 else '(Overpriced)' if z >= 1.0 else '(Fair)'}", fg=z_color)
         self.edge_labels["kelly"].config(text=f"{d['kelly_f']*100:.1f}% Allokation")
-        self.edge_labels["obi"].config(text="Live WebSocket Orderbuch")
+        self.edge_labels["obi"].config(text=f"OFI: {ofi_v:+.2f} (Hydra L2)")
 
         sig = d["signal"]
-        sig_color = "#00ff88" if sig == "BUY" else "#f43f5e" if sig == "SELL" else "#f1f5f9"
+        sig_color = "#10b981" if sig == "BUY" else "#f43f5e" if sig == "SELL" else "#f1f5f9"
         self.edge_labels["signal"].config(text=f"{sig}", fg=sig_color)
 
     def add_trade_to_ledger(self, r: dict):
