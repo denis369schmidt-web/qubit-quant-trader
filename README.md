@@ -11,7 +11,7 @@ Institutional-grade, autonomous high-frequency trading bot for **Kraken**, featu
 
 ## 🌟 Key Architecture & Highlights
 
-- **🛡️ Guaranteed-Profit & Capital Preservation Architecture**:
+- **🛡️ Capital Preservation Architecture** (keine Gewinngarantie, siehe `ANALYSE_V1.md`):
   - Exits on standard signals are restricted unless net positive profit is achieved after all exchange fees (0.52% roundtrip).
   - **Ratchet Trailing Break-Even**: Locks in net gains as soon as price appreciation exceeds +0.80%.
   - **Dynamic High-Water Trailing Take-Profit**: Rides explosive pumps with a tight 0.4% trailing delta from the peak.
@@ -28,6 +28,25 @@ Institutional-grade, autonomous high-frequency trading bot for **Kraken**, featu
   - High-contrast Dark Theme with 3 Hero KPI cards, orderbook depth radar, interactive SQLite ledger, and **one-click HTML5 Equity Visualizer**.
 - **🔔 Push Alerts**:
   - Asynchronous background alerting via Telegram Bot API and Discord Webhooks.
+
+---
+
+## 🧭 Terminal v2 (empfohlen)
+
+Neuaufbau auf Basis der Fehleranalyse in [`ANALYSE_V1.md`](ANALYSE_V1.md): echte Marktdaten, realistische Kosten,
+Walk-Forward + Permutationstest, Multi-Markt-Scanner und Paper-Trading. Echtgeld-Handel ist in v2 nicht eingebaut.
+
+```bash
+pip install -r requirements.txt
+python -m terminal scan --exchange binance --top 40                         # Märkte nach Kosten/Bewegung ranken
+python -m terminal validate --symbol BTCUSDT --strategy trend --interval 1h  # Strategie gegen Hürden prüfen
+python -m terminal paper --symbols BTCUSDT,ETHUSDT --strategy trend          # Paper-Trading mit Live-Kursen
+python -m terminal analyze --file trading_ledger.db                           # Echte v1-Trades auswerten
+python -m unittest tests.test_terminal_v2 -v
+```
+
+Strategien: `trend` (Trendfolge mit ATR-Trailing-Stop), `breakout` (Donchian), `meanrev` (H2 mit Trendfilter).
+Testnet: `BINANCE_TESTNET_KEY` / `BINANCE_TESTNET_SECRET` setzen, dann `paper --mode testnet` (benötigt `ccxt`).
 
 ---
 
